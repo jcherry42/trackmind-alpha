@@ -623,7 +623,8 @@ def _serialize_position(p: dict) -> dict:
 
 @api.get("/positions")
 async def list_positions(user: dict = Depends(get_current_user)):
-    await settle_open_positions(user)
+    # Read-only: settlement only fires on /dashboard or the scheduler so GET /positions
+    # is idempotent and cannot mutate PnL on concurrent polling.
     user_id = str(user["_id"])
     open_pos = [p async for p in db.positions.find({"user_id": user_id, "status": "open"}).sort("opened_at", -1)]
     closed_pos = [p async for p in db.positions.find({"user_id": user_id, "status": "closed"}).sort("closed_at", -1).limit(50)]
