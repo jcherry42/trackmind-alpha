@@ -1,0 +1,181 @@
+{
+  "app_name": "TRACKMIND",
+  "theme": "Dark",
+  "archetype": "Archetype 4: Swiss & High-Contrast (Tactical Command Center Variant)",
+  "emotional_tone": "Institutional, precise, elite, instantaneous. Feels like a billion-dollar hedge fund's proprietary internal tool.",
+  "design_philosophy": "Bloomberg terminal density meets Apple's optical polish and Robinhood's frictionless execution. Zero decorative gradients. Color is used strictly for data hierarchy, PnL status, and engine state.",
+  "colors": {
+    "background": {
+      "main": "#000000",
+      "surface": "#0C0C0E",
+      "surface_elevated": "#141417",
+      "modal": "#1C1C1E"
+    },
+    "text": {
+      "primary": "#FFFFFF",
+      "secondary": "#8A8A8E",
+      "tertiary": "#505055",
+      "inverse": "#000000"
+    },
+    "border": {
+      "subtle": "#1C1C1E",
+      "focus": "#303036"
+    },
+    "pnl": {
+      "positive": "#00D84A",
+      "positive_bg": "rgba(0, 216, 74, 0.1)",
+      "negative": "#FF3344",
+      "negative_bg": "rgba(255, 51, 68, 0.1)",
+      "neutral": "#8A8A8E"
+    },
+    "engines": {
+      "alpha": "#E5A823",
+      "quant": "#007AFF",
+      "whale": "#32ADE6",
+      "micro": "#FF9F0A"
+    },
+    "actions": {
+      "primary": "#FFFFFF",
+      "primary_text": "#000000",
+      "danger": "#FF3344"
+    }
+  },
+  "typography": {
+    "font_family": "System",
+    "rules": {
+      "pnl_and_metrics": {
+        "fontVariant": ["tabular-nums"],
+        "letterSpacing": -0.5,
+        "fontWeight": "700"
+      },
+      "headings": {
+        "letterSpacing": -1,
+        "fontWeight": "800"
+      },
+      "labels_overlines": {
+        "textTransform": "uppercase",
+        "letterSpacing": 1.5,
+        "fontWeight": "600",
+        "fontSize": 10
+      }
+    },
+    "scale": {
+      "h1": { "fontSize": 34, "fontWeight": "800", "lineHeight": 41 },
+      "h2": { "fontSize": 28, "fontWeight": "700", "lineHeight": 34 },
+      "h3": { "fontSize": 22, "fontWeight": "600", "lineHeight": 28 },
+      "body_large": { "fontSize": 17, "fontWeight": "500", "lineHeight": 22 },
+      "body": { "fontSize": 15, "fontWeight": "400", "lineHeight": 20 },
+      "caption": { "fontSize": 12, "fontWeight": "500", "lineHeight": 16 },
+      "micro": { "fontSize": 10, "fontWeight": "600", "lineHeight": 12, "textTransform": "uppercase" }
+    }
+  },
+  "spacing_and_layout": {
+    "base_unit": 4,
+    "scale": {
+      "xs": 4,
+      "sm": 8,
+      "md": 16,
+      "lg": 24,
+      "xl": 32,
+      "2xl": 48
+    },
+    "border_radius": {
+      "none": 0,
+      "sm": 4,
+      "md": 8,
+      "lg": 12,
+      "pill": 9999
+    },
+    "screen_padding": 16
+  },
+  "components": {
+    "cards": {
+      "background": "#0C0C0E",
+      "borderWidth": 1,
+      "borderColor": "#1C1C1E",
+      "borderRadius": 12,
+      "padding": 16,
+      "style": "Flat, sharp, zero drop shadows. Rely on borders and background contrast for depth."
+    },
+    "buttons": {
+      "primary": {
+        "backgroundColor": "#FFFFFF",
+        "color": "#000000",
+        "borderRadius": 8,
+        "paddingVertical": 14,
+        "paddingHorizontal": 24,
+        "fontWeight": "700"
+      },
+      "engine_toggle": {
+        "backgroundColor": "#1C1C1E",
+        "borderRadius": 999,
+        "paddingVertical": 8,
+        "paddingHorizontal": 16
+      }
+    },
+    "bottom_tabs": {
+      "backgroundColor": "#000000",
+      "borderTopWidth": 1,
+      "borderTopColor": "#1C1C1E",
+      "activeTintColor": "#FFFFFF",
+      "inactiveTintColor": "#505055"
+    },
+    "signal_bars": {
+      "height": 4,
+      "borderRadius": 2,
+      "backgroundColor": "#1C1C1E"
+    }
+  },
+  "icons": {
+    "library": "@expo/vector-icons",
+    "family": "Feather",
+    "strokeWidth": 2,
+    "style": "Technical, unadorned, crisp."
+  },
+  "screens": {
+    "LoginView": {
+      "layout": "Centered, pure black background.",
+      "elements": "Minimalist input fields with bottom border only (no full boxes). Face ID toggle prominently integrated. Large, high-contrast primary login button."
+    },
+    "DashboardView": {
+      "layout": "Grid-like density. Flex row for high-level metrics.",
+      "elements": "Massive tabular numbers for Total Bankroll and Today PnL. 4 Engine status pills (Alpha, Quant, Whale, Micro) showing allocation % and pulsing live dot. Prominent Paper/Live toggle in header (e.g., Live = Red/Active outline, Paper = Blue/Dashed outline)."
+    },
+    "SignalsView": {
+      "layout": "Vertical flat list.",
+      "elements": "Signal feed. Each row has extreme data density: Engine color tag (left border), Market Name, Confidence Bar (width represents edge %), Risk Score (badge). 1-tap Approve/Reject swipe actions."
+    },
+    "PositionsView": {
+      "layout": "List view with sticky section headers (Open vs Closed).",
+      "elements": "Cards displaying Entry Price, Current Price, and massive PnL colored text (Green/Red). Utilize tabular nums. Progress bar showing probability."
+    },
+    "MicroModeView": {
+      "layout": "Split-pane conceptual layout.",
+      "elements": "Cross-market spread scanner. Left column Venue A (e.g., Polymarket), Right column Venue B (e.g., Kalshi). Center column shows the Spread < $1.00 opportunity in bright accent color."
+    },
+    "AnalyticsView": {
+      "layout": "Chart-heavy.",
+      "elements": "Performance equity curve (SVG line chart if possible, or composed UI). Stat grids for Win Rate, Sharpe, Max Drawdown. Breakdown of PnL by the 4 engines."
+    },
+    "ControlsView": {
+      "layout": "Control panel / Switchboard.",
+      "elements": "Master Kill Switch (Massive Red Button, requires hold-to-confirm). Individual pause/resume toggles for Alpha, Quant, Whale, Micro. Risk constraint sliders."
+    },
+    "SettingsView": {
+      "layout": "Standard grouped list.",
+      "elements": "Account details, biometrics, notification preferences (push alerts for signals). Clean, iOS-style grouped rows."
+    }
+  },
+  "testing_requirements": {
+    "attribute": "testID",
+    "description": "All interactive elements, buttons, form inputs, and key informational metrics MUST include a 'testID' prop in React Native.",
+    "convention": "kebab-case, role-based (e.g., 'login-submit-button', 'bankroll-value-text', 'engine-alpha-toggle', 'live-paper-switch')"
+  },
+  "critical_rules": [
+    "NO Tailwind CSS. Use React Native StyleSheet.",
+    "Enforce tabular-nums on all financial figures to prevent jitter.",
+    "OLED Black (#000000) for all main backgrounds to ensure institutional hardware feel.",
+    "Never use generic standard blue for branding; use purely functional colors (Green/Red for money, Engine colors for categorization).",
+    "Zero drop shadows. Use 1px borders (#1C1C1E) to separate containers."
+  ]
+}
