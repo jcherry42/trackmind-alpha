@@ -688,6 +688,10 @@ async def approve_trade(
         raise HTTPException(status_code=400, detail="Engine is paused")
 
     bankroll = float(user["bankroll"])
+    # Caller-supplied notional must fit within bankroll — enforce strict guard BEFORE clamping
+    # so the user gets a real "insufficient bankroll" error instead of a silent 95% fill.
+    if payload.notional is not None and float(payload.notional) > bankroll:
+        raise HTTPException(status_code=400, detail="Insufficient bankroll")
     notional = payload.notional or round(min(bankroll * sig["size_hint"], bankroll * 0.15), 2)
     notional = max(1.0, min(notional, bankroll * 0.95))
 
