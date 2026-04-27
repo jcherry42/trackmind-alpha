@@ -87,7 +87,10 @@ class RateLimit:
         self.window = per_seconds
 
     def check(self, request: Request) -> None:
-        ip = request.client.host if request.client else "unknown"
+        # Prefer the left-most entry in X-Forwarded-For (originating client) when behind a proxy
+        # so the limiter windows correctly even across multiple ingress pods.
+        xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For") or ""
+        ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
         key = f"{self.bucket}:{ip}"
         now = time.time()
         hist = RateLimit._windows[key]
@@ -406,10 +409,13 @@ async def login(payload: LoginIn, request: Request, response: Response):
     ip = request.client.host if request.client else "unknown"
     identifier = f"{ip}:{email}"
 
-    # Brute force lockout
+    # Brute force lockout — coerce stored timestamp to tz-aware before subtraction.
     attempt = await db.login_attempts.find_one({"identifier": identifier})
     if attempt and attempt.get("count", 0) >= 5:
-        if (datetime.now(timezone.utc) - attempt["last_at"]).total_seconds() < 900:
+        last_at = attempt["last_at"]
+        if last_at.tzinfo is None:
+            last_at = last_at.replace(tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - last_at).total_seconds() < 900:
             raise HTTPException(status_code=429, detail="Too many failed attempts, try again later")
         await db.login_attempts.delete_one({"identifier": identifier})
 
@@ -607,6 +613,9 @@ def _serialize_position(p: dict) -> dict:
         "realized_pnl": p.get("realized_pnl"),
         "expected_edge": p.get("expected_edge", 0.0),
         "confidence": p.get("confidence", 0.0),
+        "fill_id": p.get("fill_id"),
+        "signal_id": p.get("signal_id"),
+        "broker": p.get("broker"),
         "opened_at": p.get("opened_at", datetime.now(timezone.utc)).isoformat(),
         "closed_at": p["closed_at"].isoformat() if p.get("closed_at") else None,
     }
