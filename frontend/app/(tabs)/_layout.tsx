@@ -21,63 +21,55 @@ export default function TabsLayout() {
         tabBarInactiveTintColor: colors.textTertiary,
         tabBarStyle: {
           backgroundColor: colors.bg,
-          borderTopColor: colors.borderSubtle,
+          borderTopColor: colors.borderHairline,
           borderTopWidth: 1,
-          height: Platform.OS === "ios" ? 84 : 64,
-          paddingTop: 6,
-          paddingBottom: Platform.OS === "ios" ? 24 : 8,
+          height: Platform.OS === "ios" ? 86 : 66,
+          paddingTop: 10,
+          paddingBottom: Platform.OS === "ios" ? 26 : 10,
         },
         tabBarLabelStyle: {
-          fontSize: 10,
-          fontWeight: "600",
+          fontSize: 9,
+          fontWeight: "700",
           letterSpacing: 1.2,
           textTransform: "uppercase",
+          marginTop: 4,
         },
+        tabBarIconStyle: { marginTop: 0 },
       }}
     >
       <Tabs.Screen
         name="index"
         options={{
           title: "Dash",
-          tabBarIcon: ({ color, size }) => (
-            <Feather name="grid" color={color} size={size - 2} />
-          ),
+          tabBarIcon: ({ color }) => <Feather name="grid" color={color} size={18} />,
         }}
       />
       <Tabs.Screen
         name="signals"
         options={{
           title: "Signals",
-          tabBarIcon: ({ color, size }) => (
-            <Feather name="zap" color={color} size={size - 2} />
-          ),
+          tabBarIcon: ({ color }) => <Feather name="zap" color={color} size={18} />,
         }}
       />
       <Tabs.Screen
         name="positions"
         options={{
           title: "Positions",
-          tabBarIcon: ({ color, size }) => (
-            <Feather name="briefcase" color={color} size={size - 2} />
-          ),
+          tabBarIcon: ({ color }) => <Feather name="briefcase" color={color} size={18} />,
         }}
       />
       <Tabs.Screen
         name="micro"
         options={{
           title: "Micro",
-          tabBarIcon: ({ color, size }) => (
-            <Feather name="git-merge" color={color} size={size - 2} />
-          ),
+          tabBarIcon: ({ color }) => <Feather name="git-merge" color={color} size={18} />,
         }}
       />
       <Tabs.Screen
         name="analytics"
         options={{
           title: "Analytics",
-          tabBarIcon: ({ color, size }) => (
-            <Feather name="bar-chart-2" color={color} size={size - 2} />
-          ),
+          tabBarIcon: ({ color }) => <Feather name="trending-up" color={color} size={18} />,
         }}
       />
     </Tabs>

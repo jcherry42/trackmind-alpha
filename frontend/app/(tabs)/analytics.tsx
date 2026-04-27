@@ -9,9 +9,7 @@ import {
 import { useFocusEffect } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { api } from "../../lib/api";
-import { Card } from "../../components/Card";
 import { Sparkline } from "../../components/Sparkline";
-import { ProgressBar } from "../../components/ProgressBar";
 import { MetricText, formatPct, formatUsd, pnlColor } from "../../lib/format";
 import { colors, engineColor, space, type as typo } from "../../lib/theme";
 
@@ -48,96 +46,109 @@ export default function AnalyticsScreen() {
     }, [load])
   );
 
+  const totalPnl = data?.total_pnl ?? 0;
+  const startEquity = data?.equity_curve?.[0] ?? 0;
+  const endEquity = data?.equity_curve?.[data?.equity_curve.length - 1] ?? 0;
+
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
-      <View style={styles.header}>
-        <Text style={styles.title}>ANALYTICS</Text>
-      </View>
       <ScrollView
         contentContainerStyle={styles.scroll}
         refreshControl={
-          <RefreshControl tintColor={colors.textSecondary} refreshing={loading} onRefresh={load} />
+          <RefreshControl tintColor={colors.textTertiary} refreshing={loading} onRefresh={load} />
         }
       >
-        <Card>
-          <Text style={styles.metricLabel}>EQUITY CURVE</Text>
-          {data && data.equity_curve.length > 1 ? (
-            <View style={{ marginTop: space.sm }}>
+        <View style={styles.header}>
+          <Text style={styles.title}>Analytics</Text>
+        </View>
+
+        {/* Hero — equity curve */}
+        <View style={styles.heroCard}>
+          <Text style={styles.heroLabel}>Total P&amp;L</Text>
+          <MetricText size={48} color={pnlColor(totalPnl)} style={{ letterSpacing: -1.5 }}>
+            {formatUsd(totalPnl, { sign: true })}
+          </MetricText>
+          <View style={styles.heroSubRow}>
+            <Text style={styles.subText}>{data?.trades_total ?? 0} trades</Text>
+            <View style={styles.subDot} />
+            <Text style={styles.subText}>
+              win {((data?.win_rate ?? 0) * 100).toFixed(0)}%
+            </Text>
+            <View style={styles.subDot} />
+            <Text style={styles.subText}>sharpe {data?.sharpe ?? 0}</Text>
+          </View>
+
+          <View style={styles.sparkContainer}>
+            {data && data.equity_curve.length > 1 ? (
               <Sparkline
                 data={data.equity_curve}
                 width={320}
-                height={90}
-                color={data.total_pnl >= 0 ? colors.positive : colors.negative}
+                height={110}
+                color={totalPnl >= 0 ? colors.positive : colors.negative}
                 strokeWidth={2}
               />
-              <View style={{ flexDirection: "row", justifyContent: "space-between", marginTop: space.sm }}>
-                <Text style={styles.subtle}>
-                  Start: {formatUsd(data.equity_curve[0] || 0)}
-                </Text>
-                <Text style={styles.subtle}>
-                  Now: {formatUsd(data.equity_curve[data.equity_curve.length - 1] || 0)}
-                </Text>
-              </View>
-            </View>
-          ) : (
-            <Text style={[styles.subtle, { marginTop: 6 }]}>
-              Trade activity will populate the equity curve.
-            </Text>
-          )}
-        </Card>
+            ) : (
+              <Text style={styles.sparkEmpty}>Trade activity will populate the curve.</Text>
+            )}
+          </View>
 
-        <View style={styles.statsGrid}>
-          <Stat
-            label="TOTAL P&L"
-            value={formatUsd(data?.total_pnl ?? 0, { sign: true })}
-            color={pnlColor(data?.total_pnl ?? 0)}
-          />
-          <Stat
-            label="WIN RATE"
-            value={`${((data?.win_rate ?? 0) * 100).toFixed(1)}%`}
-          />
-          <Stat label="TRADES" value={`${data?.trades_total ?? 0}`} />
-          <Stat label="SHARPE" value={`${data?.sharpe ?? 0}`} />
-          <Stat
-            label="MAX DD"
-            value={formatPct(-(data?.max_drawdown ?? 0), { decimals: 2 })}
-            color={colors.negative}
-          />
-          <Stat
-            label="AVG WIN"
-            value={formatUsd(data?.avg_win ?? 0)}
-            color={colors.positive}
-          />
+          <View style={styles.curveFooter}>
+            <Text style={styles.curveValue}>{formatUsd(startEquity, { decimals: 0 })}</Text>
+            <Text style={styles.curveValue}>{formatUsd(endEquity, { decimals: 0 })}</Text>
+          </View>
         </View>
 
-        <Text style={styles.sectionLabel}>BREAKDOWN BY ENGINE</Text>
-        {(["alpha", "quant", "whale", "micro"] as const).map((e) => {
-          const stats = data?.by_engine[e];
-          const c = engineColor(e);
-          const totalAbs = Math.max(
-            ...(["alpha", "quant", "whale", "micro"] as const).map(
-              (k) => Math.abs(data?.by_engine[k]?.pnl ?? 0)
-            ),
-            1
-          );
-          const pnl = stats?.pnl ?? 0;
-          return (
-            <Card key={e} style={{ borderLeftWidth: 3, borderLeftColor: c }}>
-              <View style={styles.engineRow}>
-                <View>
-                  <Text style={[styles.engineName, { color: c }]}>{e.toUpperCase()}</Text>
-                  <Text style={styles.subtle}>
-                    {stats?.trades ?? 0} trades · win {((stats?.win_rate ?? 0) * 100).toFixed(0)}%
+        {/* Stats — three rows of two */}
+        <View style={styles.statGrid}>
+          <Stat label="Avg win" value={formatUsd(data?.avg_win ?? 0)} color={colors.positive} />
+          <Stat label="Avg loss" value={formatUsd(data?.avg_loss ?? 0)} color={colors.negative} />
+          <Stat label="Max DD" value={formatPct(-(data?.max_drawdown ?? 0), { decimals: 2 })} color={colors.negative} />
+          <Stat label="Trades" value={`${data?.trades_total ?? 0}`} />
+        </View>
+
+        {/* By engine */}
+        <Text style={styles.section}>By Engine</Text>
+        <View style={styles.engineList}>
+          {(["alpha", "quant", "whale", "micro"] as const).map((e, i) => {
+            const stats = data?.by_engine[e];
+            const c = engineColor(e);
+            const pnl = stats?.pnl ?? 0;
+            const totalAbs = Math.max(
+              ...(["alpha", "quant", "whale", "micro"] as const).map(
+                (k) => Math.abs(data?.by_engine[k]?.pnl ?? 0)
+              ),
+              1
+            );
+            return (
+              <View key={e} style={[styles.engineRow, i < 3 && styles.engineRowDivider]}>
+                <View style={styles.engineLeft}>
+                  <View style={[styles.engineDot, { backgroundColor: c }]} />
+                  <Text style={styles.engineName}>{e.toUpperCase()}</Text>
+                  <Text style={styles.engineMeta}>
+                    {stats?.trades ?? 0} · win{" "}
+                    {((stats?.win_rate ?? 0) * 100).toFixed(0)}%
                   </Text>
                 </View>
-                <MetricText size={18} color={pnlColor(pnl)}>
-                  {formatUsd(pnl, { sign: true })}
-                </MetricText>
+                <View style={styles.engineRight}>
+                  <View style={styles.engineBarTrack}>
+                    <View
+                      style={[
+                        styles.engineBarFill,
+                        {
+                          width: `${(Math.abs(pnl) / totalAbs) * 100}%`,
+                          backgroundColor: c,
+                        },
+                      ]}
+                    />
+                  </View>
+                  <Text style={[styles.enginePnl, { color: pnlColor(pnl) }]}>
+                    {formatUsd(pnl, { sign: true, decimals: 0 })}
+                  </Text>
+                </View>
               </View>
-              <ProgressBar value={Math.abs(pnl) / totalAbs} color={c} />
-            </Card>
-          );
-        })}
+            );
+          })}
+        </View>
 
         <View style={{ height: space.xl }} />
       </ScrollView>
@@ -155,37 +166,79 @@ function Stat({
   color?: string;
 }) {
   return (
-    <View testID={`stat-${label.toLowerCase().replace(/[^a-z]/g, "-")}`} style={styles.statCard}>
-      <Text style={styles.metricLabel}>{label}</Text>
-      <MetricText size={18} color={color}>{value}</MetricText>
+    <View testID={`stat-${label.toLowerCase().replace(/[^a-z]/g, "-")}`} style={styles.statCell}>
+      <Text style={styles.statLabel}>{label}</Text>
+      <MetricText size={20} color={color}>{value}</MetricText>
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
-  header: { paddingHorizontal: space.md, paddingTop: space.sm },
-  title: { ...typo.h2, color: colors.textPrimary, letterSpacing: 1.5 },
-  scroll: { padding: space.md, gap: space.sm, paddingBottom: 60 },
-  metricLabel: { ...typo.micro, color: colors.textSecondary },
-  subtle: { color: colors.textSecondary, fontSize: 12 },
-  statsGrid: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
-  statCard: {
-    flexBasis: "31%",
-    flexGrow: 1,
-    borderWidth: 1,
-    borderColor: colors.borderSubtle,
-    borderRadius: 12,
-    padding: space.sm,
+  scroll: { paddingHorizontal: space.lg, paddingBottom: space.xl, paddingTop: space.md, gap: space.lg },
+  header: { paddingTop: space.sm },
+  title: { ...typo.h2, color: colors.textPrimary },
+  heroCard: {
     backgroundColor: colors.surface,
-    gap: 4,
+    borderRadius: 18,
+    padding: space.lg,
+    gap: space.sm,
   },
-  sectionLabel: { ...typo.micro, color: colors.textSecondary, marginTop: space.md },
-  engineRow: {
+  heroLabel: { ...typo.micro, color: colors.textTertiary },
+  heroSubRow: { flexDirection: "row", alignItems: "center", gap: 8, marginTop: 4 },
+  subText: { color: colors.textTertiary, fontSize: 12 },
+  subDot: { width: 3, height: 3, borderRadius: 1.5, backgroundColor: colors.textMuted },
+  sparkContainer: { marginTop: space.md, alignItems: "center" },
+  sparkEmpty: { color: colors.textTertiary, fontSize: 13, paddingVertical: space.lg },
+  curveFooter: {
     flexDirection: "row",
     justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: space.sm,
+    marginTop: 4,
   },
-  engineName: { ...typo.micro, fontSize: 12 },
+  curveValue: { color: colors.textTertiary, fontSize: 11, fontVariant: ["tabular-nums"] },
+
+  statGrid: { flexDirection: "row", flexWrap: "wrap", gap: space.sm },
+  statCell: {
+    flexBasis: "48%",
+    flexGrow: 1,
+    backgroundColor: colors.surface,
+    borderRadius: 14,
+    padding: space.md,
+    gap: 4,
+  },
+  statLabel: { ...typo.micro, color: colors.textTertiary },
+
+  section: { ...typo.micro, color: colors.textTertiary, marginTop: space.sm },
+  engineList: {
+    backgroundColor: colors.surface,
+    borderRadius: 16,
+    paddingHorizontal: space.md,
+  },
+  engineRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: space.md,
+  },
+  engineRowDivider: { borderBottomWidth: 1, borderBottomColor: colors.borderHairline },
+  engineLeft: { flexDirection: "row", alignItems: "center", gap: 10, flex: 1 },
+  engineDot: { width: 6, height: 6, borderRadius: 3 },
+  engineName: { color: colors.textPrimary, fontSize: 12, fontWeight: "800", letterSpacing: 1.4 },
+  engineMeta: { color: colors.textTertiary, fontSize: 11 },
+  engineRight: { flexDirection: "row", alignItems: "center", gap: 10 },
+  engineBarTrack: {
+    width: 60,
+    height: 3,
+    borderRadius: 2,
+    backgroundColor: colors.borderSubtle,
+    overflow: "hidden",
+  },
+  engineBarFill: { height: 3, borderRadius: 2 },
+  enginePnl: {
+    fontSize: 13,
+    fontWeight: "700",
+    fontVariant: ["tabular-nums"],
+    width: 60,
+    textAlign: "right",
+  },
 });

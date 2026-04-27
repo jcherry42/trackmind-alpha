@@ -12,11 +12,7 @@ import { useFocusEffect } from "expo-router";
 import { SafeAreaView } from "react-native-safe-area-context";
 import { Feather } from "@expo/vector-icons";
 import { api } from "../../lib/api";
-import { colors, engineColor, radius, space, type as typo } from "../../lib/theme";
-import { Card } from "../../components/Card";
-import { Tag } from "../../components/Tag";
-import { ProgressBar } from "../../components/ProgressBar";
-import { MetricText } from "../../lib/format";
+import { colors, engineColor, hexAlpha, space, type as typo } from "../../lib/theme";
 
 type Signal = {
   id: string;
@@ -30,7 +26,6 @@ type Signal = {
   liquidity: number;
   size_hint: number;
   rationale: string;
-  catalysts?: string[];
 };
 
 const FILTERS = ["all", "alpha", "quant", "whale", "micro"] as const;
@@ -39,6 +34,7 @@ export default function Signals() {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState<typeof FILTERS[number]>("all");
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -46,7 +42,7 @@ export default function Signals() {
       const r = await api<{ signals: Signal[] }>("/signals");
       setSignals(r.signals);
     } catch (e: any) {
-      Alert.alert("Error", e?.message || "Failed to load signals");
+      Alert.alert("Error", e?.message || "Failed");
     } finally {
       setLoading(false);
     }
@@ -75,8 +71,8 @@ export default function Signals() {
   return (
     <SafeAreaView style={styles.safe} edges={["top"]}>
       <View style={styles.header}>
-        <Text style={styles.title}>SIGNALS</Text>
-        <Text style={styles.subtle}>{filtered.length} active</Text>
+        <Text style={styles.title}>Signals</Text>
+        <Text style={styles.count}>{filtered.length}</Text>
       </View>
 
       <View style={styles.filters}>
@@ -90,16 +86,16 @@ export default function Signals() {
               onPress={() => setFilter(f)}
               style={[
                 styles.filterChip,
-                active && { borderColor: c, backgroundColor: `${c}20` },
+                active && { borderColor: c, backgroundColor: hexAlpha(c, 0.1) },
               ]}
             >
               <Text
                 style={[
                   styles.filterText,
-                  { color: active ? c : colors.textSecondary },
+                  { color: active ? c : colors.textTertiary },
                 ]}
               >
-                {f.toUpperCase()}
+                {f}
               </Text>
             </Pressable>
           );
@@ -111,111 +107,180 @@ export default function Signals() {
         data={filtered}
         keyExtractor={(s) => s.id}
         refreshControl={
-          <RefreshControl tintColor={colors.textSecondary} refreshing={loading} onRefresh={load} />
+          <RefreshControl tintColor={colors.textTertiary} refreshing={loading} onRefresh={load} />
         }
         ListEmptyComponent={
-          <Text style={[styles.subtle, { textAlign: "center", marginTop: 40 }]}>
-            No signals from this engine. The allocator is monitoring.
-          </Text>
+          <Text style={styles.empty}>No signals from this engine.</Text>
         }
-        renderItem={({ item }) => <SignalRow sig={item} onApprove={() => approve(item)} />}
-        ItemSeparatorComponent={() => <View style={{ height: space.sm }} />}
+        renderItem={({ item }) => (
+          <SignalRow
+            sig={item}
+            expanded={expanded === item.id}
+            onToggle={() => setExpanded(expanded === item.id ? null : item.id)}
+            onApprove={() => approve(item)}
+          />
+        )}
       />
     </SafeAreaView>
   );
 }
 
-function SignalRow({ sig, onApprove }: { sig: Signal; onApprove: () => void }) {
+function SignalRow({
+  sig,
+  expanded,
+  onToggle,
+  onApprove,
+}: {
+  sig: Signal;
+  expanded: boolean;
+  onToggle: () => void;
+  onApprove: () => void;
+}) {
   const c = engineColor(sig.engine);
   return (
-    <Card
-      testID={`signal-row-${sig.id}`}
-      style={{ borderLeftWidth: 3, borderLeftColor: c }}
-    >
-      <View style={styles.rowTop}>
-        <Tag label={sig.engine.toUpperCase()} color={c} />
-        <Tag label={sig.side} color={sig.side === "NO" ? colors.negative : colors.positive} />
-        <Text style={[styles.subtle, { marginLeft: "auto" }]}>
-          @ {sig.price.toFixed(3)}
-        </Text>
+    <Pressable testID={`signal-row-${sig.id}`} onPress={onToggle} style={styles.row}>
+      <View style={styles.rowMain}>
+        <View style={[styles.engineDot, { backgroundColor: c }]} />
+        <View style={{ flex: 1 }}>
+          <Text style={styles.rowMarket} numberOfLines={1}>
+            {sig.market}
+          </Text>
+          <View style={styles.rowMeta}>
+            <Text style={[styles.rowEngine, { color: c }]}>
+              {sig.engine.toUpperCase()}
+            </Text>
+            <Text style={styles.rowSep}>·</Text>
+            <Text
+              style={[
+                styles.rowSide,
+                { color: sig.side === "NO" ? colors.negative : colors.positive },
+              ]}
+            >
+              {sig.side}
+            </Text>
+            <Text style={styles.rowSep}>·</Text>
+            <Text style={styles.rowMetric}>
+              edge {(sig.expected_edge * 100).toFixed(2)}%
+            </Text>
+          </View>
+        </View>
+        <View style={styles.confColumn}>
+          <Text style={styles.confValue}>{(sig.confidence * 100).toFixed(0)}%</Text>
+          <View style={styles.confTrack}>
+            <View
+              style={[
+                styles.confFill,
+                { width: `${sig.confidence * 100}%`, backgroundColor: c },
+              ]}
+            />
+          </View>
+        </View>
       </View>
-      <Text style={styles.market}>{sig.market}</Text>
-      <Text style={styles.subtle}>{sig.rationale}</Text>
-      <View style={styles.metrics}>
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>CONF</Text>
-          <MetricText size={15}>{(sig.confidence * 100).toFixed(0)}%</MetricText>
+
+      {expanded ? (
+        <View style={styles.expanded}>
+          <Text style={styles.rationale}>{sig.rationale}</Text>
+          <View style={styles.expandedRow}>
+            <Stat label="conf" value={`${(sig.confidence * 100).toFixed(0)}%`} />
+            <Stat label="edge" value={`${(sig.expected_edge * 100).toFixed(2)}%`} />
+            <Stat label="risk" value={`${(sig.risk * 100).toFixed(2)}%`} />
+            <Stat label="size" value={`${(sig.size_hint * 100).toFixed(0)}%`} />
+            <Stat label="@" value={sig.price.toFixed(3)} />
+          </View>
+          <Pressable
+            testID={`approve-${sig.id}`}
+            onPress={onApprove}
+            style={({ pressed }) => [styles.approve, pressed && { opacity: 0.85 }]}
+          >
+            <Text style={styles.approveText}>APPROVE</Text>
+            <Feather name="arrow-up-right" size={14} color={colors.primaryText} />
+          </Pressable>
         </View>
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>EDGE</Text>
-          <MetricText size={15}>{(sig.expected_edge * 100).toFixed(2)}%</MetricText>
-        </View>
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>RISK</Text>
-          <MetricText size={15}>{(sig.risk * 100).toFixed(2)}%</MetricText>
-        </View>
-        <View style={styles.metricBlock}>
-          <Text style={styles.metricLabel}>SIZE</Text>
-          <MetricText size={15}>{(sig.size_hint * 100).toFixed(0)}%</MetricText>
-        </View>
-      </View>
-      <ProgressBar value={sig.confidence} color={c} />
-      <View style={styles.actions}>
-        <Pressable
-          testID={`approve-${sig.id}`}
-          style={styles.approveBtn}
-          onPress={onApprove}
-        >
-          <Feather name="zap" size={14} color={colors.primaryText} />
-          <Text style={styles.approveText}>APPROVE</Text>
-        </Pressable>
-      </View>
-    </Card>
+      ) : null}
+    </Pressable>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <View>
+      <Text style={styles.statLabel}>{label}</Text>
+      <Text style={styles.statValue}>{value}</Text>
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
   header: {
-    paddingHorizontal: space.md,
-    paddingTop: space.sm,
-    paddingBottom: space.xs,
     flexDirection: "row",
-    alignItems: "baseline",
     justifyContent: "space-between",
+    alignItems: "baseline",
+    paddingHorizontal: space.lg,
+    paddingTop: space.md,
   },
-  title: { ...typo.h2, color: colors.textPrimary, letterSpacing: 1.5 },
-  subtle: { color: colors.textSecondary, fontSize: 12 },
+  title: { ...typo.h2, color: colors.textPrimary },
+  count: { ...typo.metric, fontSize: 22, color: colors.textTertiary },
   filters: {
     flexDirection: "row",
-    paddingHorizontal: space.md,
+    paddingHorizontal: space.lg,
     gap: space.sm,
-    marginVertical: space.sm,
+    marginTop: space.md,
+    marginBottom: space.md,
   },
   filterChip: {
     paddingHorizontal: 14,
     paddingVertical: 6,
-    borderRadius: radius.pill,
+    borderRadius: 20,
     borderWidth: 1,
     borderColor: colors.borderSubtle,
-    backgroundColor: colors.surface,
   },
-  filterText: { ...typo.micro },
-  list: { padding: space.md, gap: space.sm, paddingBottom: 60 },
-  rowTop: { flexDirection: "row", alignItems: "center", gap: 6 },
-  market: { color: colors.textPrimary, fontSize: 16, fontWeight: "600", marginTop: 8 },
-  metrics: { flexDirection: "row", marginTop: space.md, marginBottom: space.sm, gap: space.lg },
-  metricBlock: { gap: 2 },
-  metricLabel: { ...typo.micro, color: colors.textSecondary },
-  actions: { marginTop: space.md, alignItems: "flex-end" },
-  approveBtn: {
+  filterText: { fontSize: 11, fontWeight: "600", letterSpacing: 1.2, textTransform: "uppercase" },
+  list: { paddingHorizontal: space.lg, paddingBottom: 80 },
+  empty: { color: colors.textTertiary, textAlign: "center", marginTop: space.xxl },
+  row: {
+    paddingVertical: space.md,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.borderHairline,
+  },
+  rowMain: {
     flexDirection: "row",
-    backgroundColor: colors.primary,
-    paddingHorizontal: 18,
-    paddingVertical: 10,
-    borderRadius: radius.md,
     alignItems: "center",
+    gap: space.md,
+  },
+  engineDot: { width: 8, height: 8, borderRadius: 4 },
+  rowMarket: { color: colors.textPrimary, fontSize: 15, fontWeight: "600" },
+  rowMeta: { flexDirection: "row", alignItems: "center", gap: 6, marginTop: 4 },
+  rowEngine: { fontSize: 10, fontWeight: "800", letterSpacing: 1.4 },
+  rowSep: { color: colors.textMuted, fontSize: 11 },
+  rowSide: { fontSize: 10, fontWeight: "800", letterSpacing: 1.2 },
+  rowMetric: { color: colors.textTertiary, fontSize: 11, fontVariant: ["tabular-nums"] },
+  confColumn: { alignItems: "flex-end", gap: 4, width: 56 },
+  confValue: { color: colors.textPrimary, fontSize: 13, fontWeight: "700", fontVariant: ["tabular-nums"] },
+  confTrack: { width: 48, height: 2, backgroundColor: colors.borderSubtle, borderRadius: 1 },
+  confFill: { height: 2, borderRadius: 1 },
+  expanded: { marginTop: space.md, gap: space.md },
+  rationale: { color: colors.textSecondary, fontSize: 13, lineHeight: 18 },
+  expandedRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+  },
+  statLabel: { ...typo.micro, color: colors.textTertiary },
+  statValue: {
+    color: colors.textPrimary,
+    fontSize: 14,
+    fontWeight: "700",
+    fontVariant: ["tabular-nums"],
+    marginTop: 2,
+  },
+  approve: {
+    backgroundColor: colors.primary,
+    height: 44,
+    borderRadius: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
     gap: 6,
   },
-  approveText: { color: colors.primaryText, fontWeight: "800", letterSpacing: 1 },
+  approveText: { color: colors.primaryText, fontWeight: "800", letterSpacing: 1.2, fontSize: 12 },
 });
