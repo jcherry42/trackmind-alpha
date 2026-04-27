@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 import {
   Alert,
   Pressable,
@@ -15,13 +15,41 @@ import { api } from "../lib/api";
 import { useAuth } from "../lib/auth";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
+import { ProgressBar } from "../components/ProgressBar";
 import { colors, radius, space, type as typo } from "../lib/theme";
 import { formatUsd } from "../lib/format";
+
+type Quota = {
+  date_utc: string;
+  used: number;
+  quota: number;
+  remaining: number;
+  rolls_over_at: string;
+};
 
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
   const router = useRouter();
   const [busy, setBusy] = useState(false);
+  const [quota, setQuota] = useState<Quota | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const q = await api<Quota>("/me/quota");
+        if (!cancelled) setQuota(q);
+      } catch {
+        /* silent — non-critical */
+      }
+    };
+    load();
+    const id = setInterval(load, 30_000);
+    return () => {
+      cancelled = true;
+      clearInterval(id);
+    };
+  }, []);
 
   async function setFlag(key: "biometrics_enabled" | "live_mode", value: boolean) {
     setBusy(true);
@@ -82,6 +110,37 @@ export default function SettingsScreen() {
               thumbColor={user?.biometrics_enabled ? colors.primary : colors.textTertiary}
             />
           </View>
+        </Card>
+
+        <Card>
+          <Text style={styles.metricLabel}>API QUOTA</Text>
+          {quota ? (
+            <>
+              <View style={styles.row}>
+                <Text style={styles.rowLabel}>LLM calls used today</Text>
+                <Text style={styles.rowValue}>
+                  {quota.used.toLocaleString()} / {quota.quota.toLocaleString()}
+                </Text>
+              </View>
+              <View style={{ marginTop: space.sm }}>
+                <ProgressBar
+                  value={Math.min(1, quota.used / Math.max(1, quota.quota))}
+                  color={
+                    quota.remaining <= quota.quota * 0.1
+                      ? colors.negative
+                      : quota.remaining <= quota.quota * 0.3
+                      ? colors.alpha
+                      : colors.primary
+                  }
+                />
+              </View>
+              <Text style={[styles.subtle, { marginTop: space.sm }]}>
+                Resets at midnight UTC · {quota.remaining.toLocaleString()} calls remaining
+              </Text>
+            </>
+          ) : (
+            <Text style={styles.subtle}>Loading…</Text>
+          )}
         </Card>
 
         <Card>

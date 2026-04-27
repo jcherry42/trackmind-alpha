@@ -210,6 +210,89 @@ backend:
   - task: "Phase 1 — Admin metrics + user audit endpoints"
     implemented: true
     working: true
+
+frontend:
+  - task: "Phase 2 — ErrorBoundary wraps root layout"
+    implemented: true
+    working: "NA"
+    file: "frontend/components/ErrorBoundary.tsx, frontend/app/_layout.tsx"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Class error boundary catches any child exception and shows a Reload card."
+  - task: "Phase 2 — API Quota card in Settings"
+    implemented: true
+    working: "NA"
+    file: "frontend/app/settings.tsx"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Polls /api/me/quota every 30s, shows used/quota + progress bar + reset time."
+
+backend_phase2:
+  - task: "Phase 2 — JSON structured logs + request_id middleware"
+    implemented: true
+    working: true
+    file: "backend/observability.py, backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Verified JSON log lines with request_id/user_id in backend.err.log; X-Request-ID returned on every response."
+      - working: true
+        agent: "testing"
+        comment: "PASS. TestPhase2Observability::test_request_id_header confirmed — GET /api/health returns an X-Request-ID header (>=8 chars). Verified against external EXPO_PUBLIC_BACKEND_URL."
+  - task: "Phase 2 — Prometheus /metrics + /api/metrics endpoints"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/observability.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Counters: http_requests_total, http_request_latency_seconds, llm_calls_total, llm_cache_hits_total, llm_failures_total, llm_latency_seconds, llm_quota_exceeded_total. Gauges: open_positions, engine_signals."
+      - working: true
+        agent: "testing"
+        comment: "PASS. TestPhase2Observability::test_metrics_endpoint_exposes_prom_format — GET /api/metrics (unauth, intentional for Prometheus scrapers) returns 200 with Prometheus text exposition (~33KB). Body contains tm_http_requests_total, tm_http_request_latency_seconds, tm_llm_calls_total, tm_open_positions. Confirmed unauth access does NOT leak auth-sensitive data."
+  - task: "Phase 2 — Per-user LLM quota + /me/quota + rollover"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "User default 500/day, admin 5000/day (per-user override via users.llm_daily_quota). Bucket {date, count} rolls over on first consume after UTC midnight. Engine refresh pre-consumes up to 12 credits from admin bucket; falls back to cached scores when exhausted."
+      - working: true
+        agent: "testing"
+        comment: "PASS. TestPhase2Observability::test_me_quota_endpoint — GET /api/me/quota returns {date_utc, used, quota, remaining, rolls_over_at}; admin quota=5000 (>=500 assertion holds), remaining == quota - used. Shape + math verified."
+  - task: "Phase 2 — /admin/audit with user_id filter"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Admin-only. Filter by user_id query param; limit 1..500."
+      - working: true
+        agent: "testing"
+        comment: "PASS. TestPhase2Observability::test_admin_audit_filter_by_user — GET /api/admin/audit?user_id=<admin_id>&limit=5 returns {events, count}; every event.user_id matches filter. Additional permission check: plain (non-admin) user hitting /api/admin/audit receives 403 {'detail':'Admin only'} as expected."
+
     file: "backend/server.py"
     stuck_count: 0
     priority: "medium"
@@ -437,3 +520,35 @@ agent_communication:
 
       All Phase 1 tasks now marked working: true, needs_retesting: false.
       current_focus and stuck_tasks cleared.
+  - agent: "testing"
+    message: |
+      Phase 2 observability run — FULL SUITE: 29/29 PASS (backend/tests/test_trackmind.py)
+      against external EXPO_PUBLIC_BACKEND_URL.
+
+      Pass by class:
+        ✅ TestHealth             1/1
+        ✅ TestAuth               6/6
+        ✅ TestDashboard          1/1
+        ✅ TestSignals            3/3
+        ✅ TestTradeAndPositions  4/4
+        ✅ TestAnalytics          1/1
+        ✅ TestControls           3/3
+        ✅ TestPhase1Security     6/6  (no regressions)
+        ✅ TestPhase2Observability 4/4 (NEW)
+
+      Phase 2 specifics verified:
+        - /api/metrics: unauth, 200, Prometheus text exposition (~33KB).
+          Contains tm_http_requests_total, tm_http_request_latency_seconds,
+          tm_llm_calls_total, tm_open_positions. Unauth scrape is intentional
+          (Prometheus) — confirmed no auth-sensitive data leaks.
+        - X-Request-ID header present on every response (8-char hex seen in
+          backend.err.log structured logs, e.g. "request_id":"8a1e77aee22e").
+        - /api/me/quota returns {date_utc, used, quota, remaining,
+          rolls_over_at}; admin quota=5000, remaining math correct.
+        - /api/admin/audit?user_id=<id> filters correctly; every event matches
+          filter. Extra permission check: plain (non-admin) user -> 403
+          {"detail":"Admin only"} (confirmed in backend.err.log
+          request_id=bc5cec1169bf).
+
+      Updated test_result.md: all 4 Phase 2 backend tasks now
+      working: true, needs_retesting: false.

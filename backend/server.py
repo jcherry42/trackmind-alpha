@@ -41,9 +41,25 @@ from markets import market_store, quote_to_dict
 from allocator import RiskConfig, allocate
 from engines import alpha as alpha_engine, quant as quant_engine, whale as whale_engine, micro as micro_engine
 from broker import get_broker
+from observability import (
+    configure_json_logging,
+    request_id_var,
+    user_id_var,
+    new_request_id,
+    metrics_payload,
+    http_requests_total,
+    http_request_latency,
+    llm_calls_total,
+    llm_cache_hits_total,
+    llm_failures_total,
+    llm_latency,
+    llm_quota_exceeded_total,
+    open_positions_gauge,
+    engine_signals_gauge,
+)
 
 logger = logging.getLogger("trackmind")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+configure_json_logging(level=logging.INFO)
 
 # --- Mongo ---
 mongo_client = AsyncIOMotorClient(os.environ["MONGO_URL"])
@@ -60,6 +76,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def observability_middleware(request: Request, call_next):
+    """Attach a request ID, log one structured access entry, and record Prometheus metrics."""
+    # Respect upstream trace id when present (e.g., from a gateway), else synthesise one.
+    rid = request.headers.get("x-request-id") or new_request_id()
+    rid_token = request_id_var.set(rid)
+    uid_token = user_id_var.set("-")
+    started = time.time()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        response.headers["X-Request-ID"] = rid
+        return response
+    finally:
+        elapsed = time.time() - started
+        # Normalise path: collapse raw IDs to '{id}' in label to keep cardinality bounded.
+        raw_path = request.url.path or "/"
+        parts = []
+        for seg in raw_path.split("/"):
+            if len(seg) == 24 and all(c in "0123456789abcdef" for c in seg):
+                parts.append("{id}")
+            elif len(seg) == 32 and all(c in "0123456789abcdef" for c in seg):
+                parts.append("{id}")
+            else:
+                parts.append(seg)
+        label_path = "/".join(parts) or "/"
+        try:
+            http_requests_total.labels(request.method, label_path, str(status_code)).inc()
+            http_request_latency.labels(request.method, label_path).observe(elapsed)
+        except Exception:
+            pass
+        # One structured access line per request.
+        logger.info(
+            "http_access",
+            extra={
+                "method": request.method,
+                "path": raw_path,
+                "status": status_code,
+                "latency_ms": round(elapsed * 1000, 2),
+                "ip": (request.client.host if request.client else "-"),
+                "ua": request.headers.get("user-agent", "-")[:128],
+            },
+        )
+        request_id_var.reset(rid_token)
+        user_id_var.reset(uid_token)
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TTL_MIN = 60 * 24  # 24h on mobile (refresh available)
@@ -215,6 +279,8 @@ async def get_current_user(request: Request) -> dict:
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+        # Propagate user id into logging context for this request.
+        user_id_var.set(str(user["_id"]))
         return user
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token expired")
@@ -280,13 +346,51 @@ _engine_cache_lock = asyncio.Lock()
 async def refresh_engines() -> None:
     """Run all engines, cache signals (with stable IDs)."""
     market_store.tick()
+
+    # Attribute engine-refresh LLM usage to the primary admin (engines are a system
+    # service). If the admin has exhausted quota, alpha falls back to cached scores.
+    admin_user = await db.users.find_one({"role": "admin"})
+    quota_ok = True
+    if admin_user:
+        # Best-effort *pre-consume* (up to 12 calls per refresh). If insufficient
+        # credits, disable LLM for this tick and serve from cache / heuristic.
+        quota_ok = await _check_and_consume_llm_quota(admin_user["_id"], amount=12)
+        if not quota_ok:
+            try:
+                llm_quota_exceeded_total.labels(str(admin_user["_id"])).inc()
+            except Exception:
+                pass
+            logger.info("llm_quota_exhausted_for_engine_refresh", extra={"admin_id": str(admin_user["_id"])})
+
+    # Snapshot LLM metric deltas before run so we can publish precise counters.
+    pre_calls = int(_llm_metrics.get("calls", 0))
+    pre_hits = int(_llm_metrics.get("cache_hits", 0))
+    pre_fails = int(_llm_metrics.get("failures", 0))
+    pre_ms = float(_llm_metrics.get("total_ms", 0.0))
+
     try:
         alpha_signals = await alpha_engine.run_async(
-            use_llm=True, score_cache=_alpha_cache, metrics=_llm_metrics,
+            use_llm=bool(quota_ok), score_cache=_alpha_cache, metrics=_llm_metrics,
         )
     except Exception as e:
         logger.warning(f"alpha engine error: {e}")
         alpha_signals = []
+
+    # Propagate to Prometheus.
+    try:
+        llm_calls_total.inc(int(_llm_metrics.get("calls", 0)) - pre_calls)
+        llm_cache_hits_total.inc(int(_llm_metrics.get("cache_hits", 0)) - pre_hits)
+        llm_failures_total.inc(int(_llm_metrics.get("failures", 0)) - pre_fails)
+        delta_ms = float(_llm_metrics.get("total_ms", 0.0)) - pre_ms
+        new_calls = int(_llm_metrics.get("calls", 0)) - pre_calls
+        if new_calls > 0:
+            # Average-over-calls histogram observation (one sample per call).
+            avg_s = (delta_ms / new_calls) / 1000.0
+            for _ in range(new_calls):
+                llm_latency.observe(avg_s)
+    except Exception:
+        pass
+
     quant_signals = quant_engine.run()
     whale_signals = whale_engine.run()
     micro_signals = micro_engine.run()
@@ -1010,7 +1114,124 @@ async def user_audit(limit: int = 50, user: dict = Depends(get_current_user)):
     return {"events": rows}
 
 
+ADMIN_LLM_DAILY_QUOTA = 5000
+USER_LLM_DAILY_QUOTA = 500
+
+
+def _today_utc_key() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+async def _resolve_user_quota(user: dict) -> int:
+    """Resolve a user's LLM daily quota: user-override > role default."""
+    override = user.get("llm_daily_quota")
+    if isinstance(override, int) and override > 0:
+        return override
+    return ADMIN_LLM_DAILY_QUOTA if user.get("role") == "admin" else USER_LLM_DAILY_QUOTA
+
+
+async def _check_and_consume_llm_quota(user_id_obj: ObjectId, amount: int = 1) -> bool:
+    """Atomically consume ``amount`` LLM credits from today's bucket. Returns True if consumed.
+
+    Bucket rolls over at midnight UTC (date key change).  We store ``llm_daily_usage`` as
+    {"date": "YYYY-MM-DD", "count": int} so there's no cron-dependent reset.
+    """
+    today = _today_utc_key()
+    # If a stale day row exists, reset it.
+    await db.users.update_one(
+        {"_id": user_id_obj, "llm_daily_usage.date": {"$ne": today}},
+        {"$set": {"llm_daily_usage": {"date": today, "count": 0}}},
+    )
+    user = await db.users.find_one({"_id": user_id_obj}, {"role": 1, "llm_daily_quota": 1, "llm_daily_usage": 1})
+    if not user:
+        return False
+    quota = await _resolve_user_quota(user)
+    used = int((user.get("llm_daily_usage") or {}).get("count", 0))
+    if used + amount > quota:
+        return False
+    await db.users.update_one(
+        {"_id": user_id_obj, "llm_daily_usage.date": today},
+        {"$inc": {"llm_daily_usage.count": amount}},
+    )
+    return True
+
+
+async def _current_llm_quota_snapshot(user: dict) -> dict:
+    today = _today_utc_key()
+    bucket = user.get("llm_daily_usage") or {}
+    if bucket.get("date") != today:
+        used = 0
+    else:
+        used = int(bucket.get("count", 0))
+    quota = await _resolve_user_quota(user)
+    return {
+        "date_utc": today,
+        "used": used,
+        "quota": quota,
+        "remaining": max(0, quota - used),
+        "rolls_over_at": (datetime.combine(
+            (datetime.now(timezone.utc) + timedelta(days=1)).date(), datetime.min.time(), tzinfo=timezone.utc)
+        ).isoformat(),
+    }
+
+
+@api.get("/me/quota")
+async def me_quota(user: dict = Depends(get_current_user)):
+    """Return the caller's LLM quota + today's usage."""
+    return await _current_llm_quota_snapshot(user)
+
+
+@api.get("/admin/audit")
+async def admin_audit(
+    user_id: Optional[str] = None,
+    limit: int = 100,
+    admin: dict = Depends(require_admin),
+):
+    """Admin view of the audit log. Filter by user_id if provided."""
+    limit = max(1, min(500, limit))
+    q: dict = {}
+    if user_id:
+        q["user_id"] = user_id
+    rows = [
+        {
+            "action": r.get("action"),
+            "user_id": r.get("user_id"),
+            "payload": r.get("payload", {}),
+            "ts": r["ts"].isoformat() if r.get("ts") else None,
+        }
+        async for r in db.audit_logs.find(q).sort("ts", -1).limit(limit)
+    ]
+    return {"events": rows, "count": len(rows)}
+
+
 app.include_router(api)
+
+
+# ---------- Prometheus /metrics ----------
+# Also mirrored under /api/metrics for kube-ingress compatibility.
+from starlette.responses import Response as _StarletteResponse  # noqa: E402
+
+
+async def _prom_metrics_response() -> _StarletteResponse:
+    try:
+        async with _engine_cache_lock:
+            for eng, sigs in _engine_cache["by_engine"].items():
+                engine_signals_gauge.labels(eng).set(len(sigs))
+        open_positions_gauge.set(await db.positions.count_documents({"status": "open"}))
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"metrics gauge refresh failed: {e}")
+    body, ctype = metrics_payload()
+    return _StarletteResponse(content=body, media_type=ctype)
+
+
+@app.get("/metrics")
+async def _metrics_root():
+    return await _prom_metrics_response()
+
+
+@app.get("/api/metrics")
+async def _metrics_api():
+    return await _prom_metrics_response()
 
 
 # ---------- startup ----------

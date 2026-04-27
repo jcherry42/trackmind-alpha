@@ -383,3 +383,53 @@ class TestPhase1Security:
         r = requests.get(f"{BASE_URL}/api/audit?limit=10", headers=auth_headers(tok), timeout=15)
         assert r.status_code == 200
         assert "events" in r.json()
+
+# --------------- module: phase 2 (observability) ----------------
+class TestPhase2Observability:
+    """New endpoints + structured logging introduced by the Phase 2 pass."""
+
+    def test_metrics_endpoint_exposes_prom_format(self):
+        """/api/metrics returns Prometheus text exposition with our custom counters."""
+        r = requests.get(f"{BASE_URL}/api/metrics", timeout=10)
+        assert r.status_code == 200
+        body = r.text
+        assert "tm_http_requests_total" in body
+        assert "tm_http_request_latency_seconds" in body
+        assert "tm_llm_calls_total" in body
+        assert "tm_open_positions" in body
+
+    def test_request_id_header(self):
+        """Responses carry an X-Request-ID header for trace correlation."""
+        r = requests.get(f"{BASE_URL}/api/health", timeout=10)
+        assert r.status_code == 200
+        rid = r.headers.get("x-request-id") or r.headers.get("X-Request-ID")
+        assert rid and len(rid) >= 8
+
+    def test_me_quota_endpoint(self):
+        """Authenticated user can see their LLM quota snapshot."""
+        r = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        tok = r.json()["access_token"]
+        r = requests.get(f"{BASE_URL}/api/me/quota", headers=auth_headers(tok), timeout=10)
+        assert r.status_code == 200
+        q = r.json()
+        for k in ("date_utc", "used", "quota", "remaining", "rolls_over_at"):
+            assert k in q
+        assert q["quota"] >= 500
+        assert q["remaining"] == q["quota"] - q["used"]
+
+    def test_admin_audit_filter_by_user(self):
+        """Admin audit endpoint can filter by user_id."""
+        r = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        tok = r.json()["access_token"]
+        me = requests.get(f"{BASE_URL}/api/auth/me", headers=auth_headers(tok), timeout=10).json()
+        r = requests.get(
+            f"{BASE_URL}/api/admin/audit?user_id={me['id']}&limit=5",
+            headers=auth_headers(tok),
+            timeout=10,
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "events" in data and "count" in data
+        for ev in data["events"]:
+            assert ev.get("user_id") == me["id"]
+
