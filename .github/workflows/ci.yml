@@ -33,7 +33,10 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: "20" }
       - run: corepack enable && yarn --cwd frontend install --frozen-lockfile
-      - run: yarn --cwd frontend lint || true
+      - name: TypeScript typecheck (blocking)
+        run: yarn --cwd frontend exec tsc --noEmit
+      - name: ESLint (non-blocking)
+        run: yarn --cwd frontend lint || true
 
   build:
     needs: [backend, frontend]

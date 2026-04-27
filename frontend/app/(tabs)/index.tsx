@@ -15,6 +15,8 @@ import { api } from "../../lib/api";
 import { useAuth } from "../../lib/auth";
 import { colors, engineColor, hexAlpha, space, type as typo } from "../../lib/theme";
 import { MetricText, formatPct, formatUsd, pnlColor } from "../../lib/format";
+import { haptics } from "../../lib/haptics";
+import { FadeSlideIn } from "../../components/Animated";
 
 type EngineStatus = {
   engine: string;
@@ -102,6 +104,7 @@ export default function Dashboard() {
         }
       >
         {/* Top bar */}
+        <FadeSlideIn delay={0}>
         <View style={styles.topBar}>
           <View style={styles.markRow}>
             <View style={styles.markDot} />

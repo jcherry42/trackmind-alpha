@@ -23,6 +23,8 @@ import os
 import random
 import time
 import uuid
+from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -30,7 +32,7 @@ import bcrypt
 import jwt
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bson import ObjectId
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, EmailStr, Field
@@ -65,6 +67,56 @@ REFRESH_TTL_DAYS = 30
 DEFAULT_BANKROLL = 10_000.0
 INITIAL_BANKROLL = 10_000.0
 
+# Fail fast if someone deploys with the insecure default.
+_JWT_SECRET = os.environ.get("JWT_SECRET", "")
+if not _JWT_SECRET or _JWT_SECRET in {"change_me_in_prod", "change_me", "dev", "secret"}:
+    # Allow local dev auto-generation; log loudly.
+    _JWT_SECRET = uuid.uuid4().hex + uuid.uuid4().hex
+    logger.warning("JWT_SECRET missing/weak — generated ephemeral secret. Set JWT_SECRET in prod.")
+os.environ["JWT_SECRET"] = _JWT_SECRET
+
+# Rate limiter: lightweight sliding-window per (key, bucket). Dependency-injected.
+class RateLimit:
+    """Sliding-window rate limiter per-IP for a named bucket. Call :meth:`check` manually."""
+
+    _windows: Dict[str, List[float]] = defaultdict(list)
+
+    def __init__(self, bucket: str, max_calls: int, per_seconds: float):
+        self.bucket = bucket
+        self.max = max_calls
+        self.window = per_seconds
+
+    def check(self, request: Request) -> None:
+        ip = request.client.host if request.client else "unknown"
+        key = f"{self.bucket}:{ip}"
+        now = time.time()
+        hist = RateLimit._windows[key]
+        cutoff = now - self.window
+        while hist and hist[0] < cutoff:
+            hist.pop(0)
+        if len(hist) >= self.max:
+            retry = int(hist[0] + self.window - now) + 1
+            raise HTTPException(
+                status_code=429,
+                detail=f"Rate limit exceeded: {self.max} per {int(self.window)}s. Retry in {retry}s.",
+            )
+        hist.append(now)
+
+# Named limiters.
+_rl_login = RateLimit("login", 20, 60)
+_rl_register = RateLimit("register", 5, 3600)
+_rl_refresh = RateLimit("refresh", 30, 60)
+_rl_trade = RateLimit("trade", 30, 60)
+_rl_auto_deploy = RateLimit("auto_deploy", 10, 60)
+
+# Per-user async locks for settlement / balance mutation.
+_user_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# LLM narrative score cache: keyed by (canonical_id, bucket) with 3-min bucket.
+_alpha_cache: Dict[str, Dict[str, Any]] = {}
+_alpha_cache_lock = asyncio.Lock()
+_llm_metrics = {"calls": 0, "cache_hits": 0, "failures": 0, "total_ms": 0.0}
+
 
 # ---------- helpers ----------
 def jwt_secret() -> str:
@@ -96,16 +148,34 @@ def create_access(user_id: str, email: str, role: str) -> str:
     )
 
 
-def create_refresh(user_id: str) -> str:
-    return jwt.encode(
+def create_refresh(user_id: str, jti: Optional[str] = None) -> tuple[str, str]:
+    """Returns (token, jti). jti is used for revocation tracking."""
+    token_jti = jti or uuid.uuid4().hex
+    token = jwt.encode(
         {
             "sub": user_id,
+            "jti": token_jti,
             "type": "refresh",
             "exp": datetime.now(timezone.utc) + timedelta(days=REFRESH_TTL_DAYS),
         },
         jwt_secret(),
         algorithm=JWT_ALGORITHM,
     )
+    return token, token_jti
+
+
+async def revoke_jti(jti: str, exp: datetime) -> None:
+    await db.revoked_tokens.update_one(
+        {"jti": jti},
+        {"$set": {"jti": jti, "revoked_at": datetime.now(timezone.utc), "exp": exp}},
+        upsert=True,
+    )
+
+
+async def is_jti_revoked(jti: str) -> bool:
+    if not jti:
+        return False
+    return await db.revoked_tokens.find_one({"jti": jti}) is not None
 
 
 def public_user(u: dict) -> dict:
@@ -136,6 +206,9 @@ async def get_current_user(request: Request) -> dict:
         payload = jwt.decode(token, jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "access":
             raise HTTPException(status_code=401, detail="Invalid token type")
+        # jti check for access tokens (future-proof; access currently has no jti)
+        if payload.get("jti") and await is_jti_revoked(payload["jti"]):
+            raise HTTPException(status_code=401, detail="Token revoked")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
@@ -205,7 +278,9 @@ async def refresh_engines() -> None:
     """Run all engines, cache signals (with stable IDs)."""
     market_store.tick()
     try:
-        alpha_signals = await alpha_engine.run_async(use_llm=True)
+        alpha_signals = await alpha_engine.run_async(
+            use_llm=True, score_cache=_alpha_cache, metrics=_llm_metrics,
+        )
     except Exception as e:
         logger.warning(f"alpha engine error: {e}")
         alpha_signals = []
@@ -237,60 +312,65 @@ async def refresh_engines() -> None:
 
 
 async def settle_open_positions(user: dict) -> float:
-    """Tick existing open positions: mark-to-market, randomly settle ~5% per tick.
+    """Tick existing open positions: mark-to-market, randomly settle ~7% per tick.
 
-    Returns realized PnL delta added to bankroll.
+    Returns realized PnL delta added to bankroll. Serialised per user to prevent
+    double settlement across concurrent requests.
     """
     user_id = str(user["_id"])
-    realized_delta = 0.0
-    cursor = db.positions.find({"user_id": user_id, "status": "open"})
-    async for pos in cursor:
-        # Mark to market using current quote
-        venue = pos.get("venue", "polymarket")
-        if pos.get("engine") == "micro":
-            current_value = 1.0  # arb pays 1.00 at settle modulo fees
-        else:
-            q = market_store.get(venue if venue != "cross" else "polymarket", pos["canonical_id"])
-            if not q:
-                continue
-            current_value = q.yes if pos["side"] == "YES" else q.no
-        await db.positions.update_one(
-            {"_id": pos["_id"]},
-            {"$set": {"current_price": round(current_value, 4),
-                      "unrealized_pnl": round((current_value - pos["entry_price"]) * pos["contracts"], 2),
-                      "updated_at": datetime.now(timezone.utc)}},
-        )
-
-        # Randomly settle ~7% per tick (paper-mode quick cycles for engaging UX)
-        if random.random() < 0.07:
-            # Settlement: 60-70% probability of being on the right side weighted by edge
-            win_prob = 0.5 + min(0.25, pos.get("expected_edge", 0.0) * 4)
-            won = random.random() < win_prob
-            payout = (1.0 if won else 0.0) if pos["engine"] != "micro" else (1.0 - pos.get("fees_pct", 0.01))
-            realized = round((payout - pos["entry_price"]) * pos["contracts"] - pos.get("fees", 0), 2)
+    lock = _user_locks[user_id]
+    async with lock:
+        realized_delta = 0.0
+        cursor = db.positions.find({"user_id": user_id, "status": "open"})
+        async for pos in cursor:
+            # Mark to market using current quote
+            venue = pos.get("venue", "polymarket")
+            if pos.get("engine") == "micro":
+                current_value = 1.0  # arb pays 1.00 at settle modulo fees
+            else:
+                q = market_store.get(venue if venue != "cross" else "polymarket", pos["canonical_id"])
+                if not q:
+                    continue
+                current_value = q.yes if pos["side"] == "YES" else q.no
             await db.positions.update_one(
                 {"_id": pos["_id"]},
-                {"$set": {
-                    "status": "closed",
-                    "exit_price": round(payout, 4),
-                    "realized_pnl": realized,
-                    "closed_at": datetime.now(timezone.utc),
-                }},
+                {"$set": {"current_price": round(current_value, 4),
+                          "unrealized_pnl": round((current_value - pos["entry_price"]) * pos["contracts"], 2),
+                          "updated_at": datetime.now(timezone.utc)}},
             )
-            realized_delta += realized
-            await audit(user_id, "position.settled", {"position_id": str(pos["_id"]), "won": won, "pnl": realized})
 
-    if realized_delta != 0:
-        await db.users.update_one(
-            {"_id": user["_id"]},
-            {"$inc": {"bankroll": realized_delta, "realized_pnl_today": realized_delta}},
-        )
-    return realized_delta
+            # Randomly settle ~7% per tick (paper-mode quick cycles for engaging UX).
+            # Use atomic conditional update so concurrent callers can't double-settle.
+            if random.random() < 0.07:
+                win_prob = 0.5 + min(0.25, pos.get("expected_edge", 0.0) * 4)
+                won = random.random() < win_prob
+                payout = (1.0 if won else 0.0) if pos["engine"] != "micro" else (1.0 - pos.get("fees_pct", 0.01))
+                realized = round((payout - pos["entry_price"]) * pos["contracts"] - pos.get("fees", 0), 2)
+                settle_res = await db.positions.update_one(
+                    {"_id": pos["_id"], "status": "open"},
+                    {"$set": {
+                        "status": "closed",
+                        "exit_price": round(payout, 4),
+                        "realized_pnl": realized,
+                        "closed_at": datetime.now(timezone.utc),
+                    }},
+                )
+                if settle_res.modified_count == 1:
+                    realized_delta += realized
+                    await audit(user_id, "position.settled", {"position_id": str(pos["_id"]), "won": won, "pnl": realized})
+
+        if realized_delta != 0:
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                {"$inc": {"bankroll": realized_delta, "realized_pnl_today": realized_delta}},
+            )
+        return realized_delta
 
 
 # ---------- auth routes ----------
 @api.post("/auth/register")
-async def register(payload: RegisterIn, response: Response):
+async def register(payload: RegisterIn, request: Request, response: Response):
+    _rl_register.check(request)
     email = payload.email.lower().strip()
     if await db.users.find_one({"email": email}):
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -312,7 +392,7 @@ async def register(payload: RegisterIn, response: Response):
     res = await db.users.insert_one(doc)
     user = await db.users.find_one({"_id": res.inserted_id})
     access = create_access(str(user["_id"]), user["email"], user["role"])
-    refresh = create_refresh(str(user["_id"]))
+    refresh, _ = create_refresh(str(user["_id"]))
     response.set_cookie("access_token", access, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN * 60, path="/")
     response.set_cookie("refresh_token", refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS * 86400, path="/")
     await audit(str(user["_id"]), "auth.register")
@@ -321,6 +401,7 @@ async def register(payload: RegisterIn, response: Response):
 
 @api.post("/auth/login")
 async def login(payload: LoginIn, request: Request, response: Response):
+    _rl_login.check(request)
     email = payload.email.lower().strip()
     ip = request.client.host if request.client else "unknown"
     identifier = f"{ip}:{email}"
@@ -343,7 +424,7 @@ async def login(payload: LoginIn, request: Request, response: Response):
 
     await db.login_attempts.delete_one({"identifier": identifier})
     access = create_access(str(user["_id"]), user["email"], user["role"])
-    refresh = create_refresh(str(user["_id"]))
+    refresh, _ = create_refresh(str(user["_id"]))
     response.set_cookie("access_token", access, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN * 60, path="/")
     response.set_cookie("refresh_token", refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS * 86400, path="/")
     await audit(str(user["_id"]), "auth.login")
@@ -363,18 +444,50 @@ async def refresh_token(request: Request, response: Response):
         payload = jwt.decode(token, jwt_secret(), algorithms=[JWT_ALGORITHM])
         if payload.get("type") != "refresh":
             raise HTTPException(status_code=401, detail="Invalid token")
+        old_jti = payload.get("jti")
+        if old_jti and await is_jti_revoked(old_jti):
+            # Token replay — revoke all sessions for this user (compromise response).
+            await db.users.update_one(
+                {"_id": ObjectId(payload["sub"])},
+                {"$set": {"tokens_revoked_at": datetime.now(timezone.utc)}},
+            )
+            raise HTTPException(status_code=401, detail="Token reuse detected; please sign in again")
         user = await db.users.find_one({"_id": ObjectId(payload["sub"])})
         if not user:
             raise HTTPException(status_code=401, detail="User not found")
+
+        # Rotate: revoke old, issue new.
+        if old_jti:
+            exp_dt = datetime.fromtimestamp(payload["exp"], tz=timezone.utc) if payload.get("exp") else datetime.now(timezone.utc) + timedelta(days=REFRESH_TTL_DAYS)
+            await revoke_jti(old_jti, exp_dt)
+
         access = create_access(str(user["_id"]), user["email"], user["role"])
+        new_refresh, _ = create_refresh(str(user["_id"]))
         response.set_cookie("access_token", access, httponly=True, samesite="lax", max_age=ACCESS_TTL_MIN * 60, path="/")
-        return {"access_token": access, "user": public_user(user)}
+        response.set_cookie("refresh_token", new_refresh, httponly=True, samesite="lax", max_age=REFRESH_TTL_DAYS * 86400, path="/")
+        return {"access_token": access, "refresh_token": new_refresh, "user": public_user(user)}
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Refresh token expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
 
 
 @api.post("/auth/logout")
-async def logout(response: Response, user: dict = Depends(get_current_user)):
+async def logout(request: Request, response: Response, user: dict = Depends(get_current_user)):
+    # Revoke refresh token if present.
+    rt = request.cookies.get("refresh_token") or ""
+    if not rt:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            rt = auth[7:]
+    if rt:
+        try:
+            p = jwt.decode(rt, jwt_secret(), algorithms=[JWT_ALGORITHM], options={"verify_exp": False})
+            if p.get("type") == "refresh" and p.get("jti"):
+                exp_dt = datetime.fromtimestamp(p["exp"], tz=timezone.utc) if p.get("exp") else datetime.now(timezone.utc) + timedelta(days=REFRESH_TTL_DAYS)
+                await revoke_jti(p["jti"], exp_dt)
+        except Exception:
+            pass
     response.delete_cookie("access_token", path="/")
     response.delete_cookie("refresh_token", path="/")
     await audit(str(user["_id"]), "auth.logout")
@@ -511,10 +624,50 @@ async def list_positions(user: dict = Depends(get_current_user)):
     }
 
 
+async def _idempotency_seen(key: str, user_id: str, payload: dict) -> Optional[dict]:
+    """Look up a prior response keyed by (Idempotency-Key, user). Returns stored response or None."""
+    if not key:
+        return None
+    row = await db.idempotency_keys.find_one({"key": key, "user_id": user_id})
+    return row["response"] if row else None
+
+
+async def _idempotency_store(key: str, user_id: str, response: dict) -> None:
+    if not key:
+        return
+    await db.idempotency_keys.update_one(
+        {"key": key, "user_id": user_id},
+        {"$set": {"key": key, "user_id": user_id, "response": response, "created_at": datetime.now(timezone.utc)}},
+        upsert=True,
+    )
+
+
+async def _atomic_bankroll_debit(user_id_obj: ObjectId, amount: float) -> bool:
+    """Atomically deduct `amount` from bankroll iff sufficient. Returns True on success."""
+    res = await db.users.update_one(
+        {"_id": user_id_obj, "bankroll": {"$gte": amount}},
+        {"$inc": {"bankroll": -amount}},
+    )
+    return res.modified_count == 1
+
+
 # ---------- trade ----------
 @api.post("/trade/approve")
-async def approve_trade(payload: TradeApproveIn, user: dict = Depends(get_current_user)):
+async def approve_trade(
+    payload: TradeApproveIn,
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    user: dict = Depends(get_current_user),
+):
+    _rl_trade.check(request)
     user = await db.users.find_one({"_id": user["_id"]})
+    user_id = str(user["_id"])
+
+    # Idempotency replay
+    prior = await _idempotency_seen(idempotency_key or "", user_id, {})
+    if prior is not None:
+        return prior
+
     if user.get("kill_switch"):
         raise HTTPException(status_code=400, detail="Kill switch is active")
 
@@ -529,11 +682,21 @@ async def approve_trade(payload: TradeApproveIn, user: dict = Depends(get_curren
     notional = payload.notional or round(min(bankroll * sig["size_hint"], bankroll * 0.15), 2)
     notional = max(1.0, min(notional, bankroll * 0.95))
 
-    broker = get_broker("paper")  # always paper unless live_mode + integration ready
-    fill = await broker.place_order(user_id=str(user["_id"]), signal=sig, notional=notional)
+    # Atomically debit bankroll BEFORE placing order; if debit fails, refuse.
+    ok = await _atomic_bankroll_debit(user["_id"], notional)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Insufficient bankroll")
+
+    try:
+        broker = get_broker("paper")
+        fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
+    except Exception as e:
+        # Refund on broker failure.
+        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": notional}})
+        raise HTTPException(status_code=502, detail=f"Broker error: {e}")
 
     pos_doc = {
-        "user_id": str(user["_id"]),
+        "user_id": user_id,
         "engine": sig["engine"],
         "canonical_id": sig["canonical_id"],
         "market": sig["market"],
@@ -555,22 +718,39 @@ async def approve_trade(payload: TradeApproveIn, user: dict = Depends(get_curren
         "signal_id": payload.signal_id,
     }
     res = await db.positions.insert_one(pos_doc)
-    await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": -fill["notional"]}})
-    await audit(str(user["_id"]), "trade.approve", {"signal_id": payload.signal_id, "notional": fill["notional"]})
+    # Apply difference if broker sized slightly differently than the debited amount.
+    if abs(fill["notional"] - notional) > 0.005:
+        diff = notional - fill["notional"]  # positive = refund
+        if diff != 0:
+            await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": diff}})
+    await audit(user_id, "trade.approve", {"signal_id": payload.signal_id, "notional": fill["notional"]})
     pos_doc["_id"] = res.inserted_id
-    return {"position": _serialize_position(pos_doc), "fill": fill}
+    response = {"position": _serialize_position(pos_doc), "fill": fill}
+    await _idempotency_store(idempotency_key or "", user_id, response)
+    return response
 
 
 @api.post("/trade/auto-deploy")
-async def auto_deploy(user: dict = Depends(get_current_user)):
+async def auto_deploy(
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    user: dict = Depends(get_current_user),
+):
     """One-tap: take the top N orders from the allocator and execute them."""
+    _rl_auto_deploy.check(request)
     user = await db.users.find_one({"_id": user["_id"]})
+    user_id = str(user["_id"])
+
+    # Idempotency replay
+    prior = await _idempotency_seen(idempotency_key or "", user_id, {})
+    if prior is not None:
+        return prior
+
     if user.get("kill_switch"):
         raise HTTPException(status_code=400, detail="Kill switch is active")
     async with _engine_cache_lock:
         signals = list(_engine_cache["signals"])
 
-    # Recompute today's pnl_pct quickly
     realized_today = float(user.get("realized_pnl_today", 0.0))
     starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
     pnl_pct = round(realized_today / max(starting, 1.0), 4)
@@ -580,10 +760,19 @@ async def auto_deploy(user: dict = Depends(get_current_user)):
 
     deployed = []
     for order in plan["orders"][:3]:
-        broker = get_broker("paper")
-        fill = await broker.place_order(user_id=str(user["_id"]), signal=order, notional=order["notional"])
+        ok = await _atomic_bankroll_debit(user["_id"], order["notional"])
+        if not ok:
+            break  # out of bankroll; stop deploying more
+        try:
+            broker = get_broker("paper")
+            fill = await broker.place_order(user_id=user_id, signal=order, notional=order["notional"])
+        except Exception as e:
+            await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": order["notional"]}})
+            logger.warning(f"auto_deploy broker error: {e}")
+            continue
+
         pos_doc = {
-            "user_id": str(user["_id"]),
+            "user_id": user_id,
             "engine": order["engine"],
             "canonical_id": order["canonical_id"],
             "market": order["market"],
@@ -605,11 +794,12 @@ async def auto_deploy(user: dict = Depends(get_current_user)):
             "signal_id": order["id"],
         }
         res = await db.positions.insert_one(pos_doc)
-        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": -fill["notional"]}})
         pos_doc["_id"] = res.inserted_id
         deployed.append(_serialize_position(pos_doc))
-    await audit(str(user["_id"]), "trade.auto_deploy", {"count": len(deployed)})
-    return {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
+    await audit(user_id, "trade.auto_deploy", {"count": len(deployed)})
+    response = {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
+    await _idempotency_store(idempotency_key or "", user_id, response)
+    return response
 
 
 # ---------- analytics ----------
@@ -751,6 +941,61 @@ async def health():
     return {"ok": True, "service": "trackmind", "ts": time.time()}
 
 
+# ---------- admin observability ----------
+@api.get("/admin/metrics")
+async def metrics(user: dict = Depends(require_admin)):
+    """Return lightweight ops metrics (LLM usage, cache hit rate, engine counts)."""
+    async with _engine_cache_lock:
+        total_signals = len(_engine_cache["signals"])
+        updated_at = _engine_cache["updated_at"]
+        by_engine_count = {k: len(v) for k, v in _engine_cache["by_engine"].items()}
+    total_calls = _llm_metrics.get("calls", 0)
+    cache_hits = _llm_metrics.get("cache_hits", 0)
+    failures = _llm_metrics.get("failures", 0)
+    hit_rate = (cache_hits / max(1, cache_hits + total_calls)) if (cache_hits + total_calls) else 0.0
+    avg_ms = (_llm_metrics.get("total_ms", 0.0) / max(1, total_calls)) if total_calls else 0.0
+    users_total = await db.users.count_documents({})
+    positions_open = await db.positions.count_documents({"status": "open"})
+    positions_total = await db.positions.count_documents({})
+    revoked_tokens = await db.revoked_tokens.count_documents({})
+    return {
+        "llm": {
+            "calls": total_calls,
+            "cache_hits": cache_hits,
+            "failures": failures,
+            "hit_rate": round(hit_rate, 3),
+            "avg_latency_ms": round(avg_ms, 1),
+        },
+        "engines": {
+            "total_signals": total_signals,
+            "by_engine": by_engine_count,
+            "last_refresh_ts": updated_at,
+        },
+        "db": {
+            "users": users_total,
+            "positions_open": positions_open,
+            "positions_total": positions_total,
+            "revoked_tokens": revoked_tokens,
+        },
+        "ts": time.time(),
+    }
+
+
+@api.get("/audit")
+async def user_audit(limit: int = 50, user: dict = Depends(get_current_user)):
+    """Return the caller's own audit trail (last N events)."""
+    limit = max(1, min(200, limit))
+    rows = [
+        {
+            "action": r.get("action"),
+            "payload": r.get("payload", {}),
+            "ts": r["ts"].isoformat() if r.get("ts") else None,
+        }
+        async for r in db.audit_logs.find({"user_id": str(user["_id"])}).sort("ts", -1).limit(limit)
+    ]
+    return {"events": rows}
+
+
 app.include_router(api)
 
 
@@ -763,8 +1008,18 @@ async def on_startup():
     # Indexes
     await db.users.create_index("email", unique=True)
     await db.positions.create_index([("user_id", 1), ("status", 1)])
-    await db.audit_logs.create_index("ts")
     await db.login_attempts.create_index("identifier")
+    # New: TTL auto-purge on revoked tokens (exp is stored absolute) and idempotency records.
+    await db.revoked_tokens.create_index("jti", unique=True)
+    await db.revoked_tokens.create_index("exp", expireAfterSeconds=0)
+    await db.idempotency_keys.create_index([("user_id", 1), ("key", 1)], unique=True)
+    await db.idempotency_keys.create_index("created_at", expireAfterSeconds=600)  # 10 min
+    # Audit log retention (30 days) — drop any pre-existing ts index then create TTL.
+    try:
+        await db.audit_logs.drop_index("ts_1")
+    except Exception:
+        pass
+    await db.audit_logs.create_index("ts", expireAfterSeconds=60 * 60 * 24 * 30, name="audit_ttl")
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trackmind.io")

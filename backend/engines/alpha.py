@@ -54,8 +54,12 @@ def _heuristic_score(catalysts: List[dict]) -> float:
     return sum(c["sentiment"] for c in catalysts) / len(catalysts)
 
 
-async def _llm_narrative_score(market_title: str, catalysts: List[dict]) -> float | None:
-    """Ask the LLM for a unified narrative score in [-1, 1]. Returns None on failure."""
+async def _llm_narrative_score(market_title: str, catalysts: List[dict], cache_key: str | None = None) -> float | None:
+    """Ask the LLM for a unified narrative score in [-1, 1]. Returns None on failure.
+
+    Caller passes ``cache_key`` (canonical_id + bucket) — scores are cached via the
+    module-level cache in server.py.  This module does NOT cache itself; it's a pure call.
+    """
     api_key = os.environ.get("EMERGENT_LLM_KEY")
     if not api_key or not catalysts:
         return None
@@ -92,7 +96,12 @@ async def _llm_narrative_score(market_title: str, catalysts: List[dict]) -> floa
         return None
 
 
-async def run_async(use_llm: bool = True) -> List[dict]:
+async def run_async(use_llm: bool = True, score_cache: dict | None = None, metrics: dict | None = None) -> List[dict]:
+    """Generate alpha signals.
+
+    ``score_cache``: optional {canonical_id: {"bucket": int, "score": float}} dict reused across
+    invocations to skip LLM calls when bucket hasn't advanced.  ``metrics`` is a simple counter dict.
+    """
     signals: List[dict] = []
     bucket = int(time.time() // 180)
     rng = random.Random(bucket)
@@ -109,9 +118,27 @@ async def run_async(use_llm: bool = True) -> List[dict]:
             {**c, "sentiment": max(-1.0, min(1.0, c["sentiment"] + rng.uniform(-0.1, 0.1)))}
             for c in catalysts
         ]
+
         score: float | None = None
-        if use_llm:
+        cache_hit = False
+        if score_cache is not None:
+            cached = score_cache.get(q.canonical_id)
+            if cached and cached.get("bucket") == bucket:
+                score = cached["score"]
+                cache_hit = True
+                if metrics is not None:
+                    metrics["cache_hits"] = metrics.get("cache_hits", 0) + 1
+
+        if score is None and use_llm:
+            t0 = time.time()
             score = await _llm_narrative_score(q.title, noisy)
+            if metrics is not None:
+                metrics["calls"] = metrics.get("calls", 0) + 1
+                metrics["total_ms"] = metrics.get("total_ms", 0.0) + (time.time() - t0) * 1000
+                if score is None:
+                    metrics["failures"] = metrics.get("failures", 0) + 1
+            if score is not None and score_cache is not None:
+                score_cache[q.canonical_id] = {"bucket": bucket, "score": score}
         if score is None:
             score = _heuristic_score(noisy)
 
@@ -145,6 +172,7 @@ async def run_async(use_llm: bool = True) -> List[dict]:
             "rationale": f"Narrative {score:+.2f} → implied {implied:.2f} vs market {q.yes:.2f}",
             "catalysts": [c["headline"] for c in noisy],
             "narrative_id": h,
+            "cache_hit": cache_hit,
         })
     signals.sort(key=lambda s: s["confidence"] * s["expected_edge"], reverse=True)
     return signals[:8]

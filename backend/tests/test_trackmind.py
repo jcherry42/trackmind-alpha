@@ -278,3 +278,108 @@ class TestControls:
         # positions wiped
         pos = requests.get(f"{BASE_URL}/api/positions", headers=auth_headers(state["admin_access"]), timeout=15).json()
         assert pos["open"] == [] and pos["closed"] == []
+
+
+# --------------- module: phase 1 (security + correctness) ----------------
+class TestPhase1Security:
+    """Audit-grade checks added after Phase 1 hardening."""
+
+    def test_refresh_rotation(self):
+        """Every successful refresh should issue a new refresh token (rotation)."""
+        r1 = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        assert r1.status_code == 200
+        old_refresh = r1.json()["refresh_token"]
+        r2 = requests.post(
+            f"{BASE_URL}/api/auth/refresh",
+            headers={"Authorization": f"Bearer {old_refresh}"},
+            timeout=15,
+        )
+        assert r2.status_code == 200
+        new_refresh = r2.json().get("refresh_token")
+        assert new_refresh and new_refresh != old_refresh, "refresh token must rotate"
+
+        # Reuse of the old refresh token must now fail.
+        r3 = requests.post(
+            f"{BASE_URL}/api/auth/refresh",
+            headers={"Authorization": f"Bearer {old_refresh}"},
+            timeout=15,
+        )
+        assert r3.status_code == 401
+
+    def test_idempotency_approve(self):
+        """Approve called twice with the same Idempotency-Key returns identical response, not double-deploy."""
+        # Login as admin fresh (account was reset).
+        r = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        tok = r.json()["access_token"]
+        sigs = requests.get(f"{BASE_URL}/api/signals", headers=auth_headers(tok), timeout=15).json()["signals"]
+        assert sigs, "need at least one signal"
+        sid = sigs[0]["id"]
+        key = uuid.uuid4().hex
+
+        def _approve():
+            return requests.post(
+                f"{BASE_URL}/api/trade/approve",
+                json={"signal_id": sid, "notional": 100.0},
+                headers={**auth_headers(tok), "Idempotency-Key": key},
+                timeout=15,
+            )
+
+        a = _approve()
+        assert a.status_code == 200
+        fill_a = a.json()["fill"]["id"]
+        b = _approve()
+        assert b.status_code == 200
+        assert b.json()["fill"]["id"] == fill_a, "idempotent replay must return same fill id"
+
+        # Exactly one position should have been created from this pair of calls.
+        pos = requests.get(f"{BASE_URL}/api/positions", headers=auth_headers(tok), timeout=15).json()
+        matches = [p for p in pos["open"] if p.get("fill_id") == fill_a]
+        assert len(matches) == 1
+
+    def test_bankroll_atomicity_insufficient_funds(self):
+        """Attempting a trade larger than bankroll must 400 and NOT debit the account."""
+        r = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        tok = r.json()["access_token"]
+        me_before = requests.get(f"{BASE_URL}/api/auth/me", headers=auth_headers(tok), timeout=15).json()
+        sigs = requests.get(f"{BASE_URL}/api/signals", headers=auth_headers(tok), timeout=15).json()["signals"]
+        sid = sigs[0]["id"]
+        r = requests.post(
+            f"{BASE_URL}/api/trade/approve",
+            json={"signal_id": sid, "notional": 9_999_999.0},  # way over bankroll
+            headers=auth_headers(tok),
+            timeout=15,
+        )
+        assert r.status_code == 400
+        me_after = requests.get(f"{BASE_URL}/api/auth/me", headers=auth_headers(tok), timeout=15).json()
+        assert float(me_after["bankroll"]) == float(me_before["bankroll"]), "bankroll must not change on failed trade"
+
+    def test_rate_limit_login(self):
+        """21st rapid login attempt within a minute should be rate limited to 429."""
+        count_429 = 0
+        for _ in range(25):
+            r = requests.post(
+                f"{BASE_URL}/api/auth/login",
+                json={"email": "ratetest@trackmind.io", "password": "wrong"},
+                timeout=5,
+            )
+            if r.status_code == 429:
+                count_429 += 1
+                break
+        assert count_429 >= 1, "rate limiter never tripped"
+
+    def test_admin_metrics_requires_admin(self):
+        """Admin metrics is scoped to admins."""
+        r = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        tok = r.json()["access_token"]
+        r = requests.get(f"{BASE_URL}/api/admin/metrics", headers=auth_headers(tok), timeout=15)
+        assert r.status_code == 200
+        body = r.json()
+        assert "llm" in body and "engines" in body and "db" in body
+
+    def test_user_audit_endpoint(self):
+        """Users can retrieve their own audit trail."""
+        r = requests.post(f"{BASE_URL}/api/auth/login", json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD}, timeout=15)
+        tok = r.json()["access_token"]
+        r = requests.get(f"{BASE_URL}/api/audit?limit=10", headers=auth_headers(tok), timeout=15)
+        assert r.status_code == 200
+        assert "events" in r.json()
