@@ -12,6 +12,7 @@ import { api } from "../../lib/api";
 import { Sparkline } from "../../components/Sparkline";
 import { MetricText, formatPct, formatUsd, pnlColor } from "../../lib/format";
 import { colors, engineColor, space, type as typo } from "../../lib/theme";
+import { FadeSlideIn } from "../../components/Animated";
 
 type Analytics = {
   trades_total: number;
@@ -63,6 +64,7 @@ export default function AnalyticsScreen() {
         </View>
 
         {/* Hero — equity curve */}
+        <FadeSlideIn delay={60}>
         <View style={styles.heroCard}>
           <Text style={styles.heroLabel}>Total P&amp;L</Text>
           <MetricText size={48} color={pnlColor(totalPnl)} style={{ letterSpacing: -1.5 }}>
@@ -97,16 +99,20 @@ export default function AnalyticsScreen() {
             <Text style={styles.curveValue}>{formatUsd(endEquity, { decimals: 0 })}</Text>
           </View>
         </View>
+        </FadeSlideIn>
 
         {/* Stats — three rows of two */}
+        <FadeSlideIn delay={160}>
         <View style={styles.statGrid}>
           <Stat label="Avg win" value={formatUsd(data?.avg_win ?? 0)} color={colors.positive} />
           <Stat label="Avg loss" value={formatUsd(data?.avg_loss ?? 0)} color={colors.negative} />
           <Stat label="Max DD" value={formatPct(-(data?.max_drawdown ?? 0), { decimals: 2 })} color={colors.negative} />
           <Stat label="Trades" value={`${data?.trades_total ?? 0}`} />
         </View>
+        </FadeSlideIn>
 
         {/* By engine */}
+        <FadeSlideIn delay={260}>
         <Text style={styles.section}>By Engine</Text>
         <View style={styles.engineList}>
           {(["alpha", "quant", "whale", "micro"] as const).map((e, i) => {
@@ -149,6 +155,7 @@ export default function AnalyticsScreen() {
             );
           })}
         </View>
+        </FadeSlideIn>
 
         <View style={{ height: space.xl }} />
       </ScrollView>

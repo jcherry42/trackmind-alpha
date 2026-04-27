@@ -13,6 +13,9 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Feather } from "@expo/vector-icons";
 import { api } from "../../lib/api";
 import { colors, engineColor, hexAlpha, space, type as typo } from "../../lib/theme";
+import { haptics } from "../../lib/haptics";
+import { FadeSlideIn } from "../../components/Animated";
+import { SignalsListSkeleton } from "../../components/Skeletons";
 
 type Signal = {
   id: string;
@@ -33,6 +36,7 @@ const FILTERS = ["all", "alpha", "quant", "whale", "micro"] as const;
 export default function Signals() {
   const [signals, setSignals] = useState<Signal[]>([]);
   const [loading, setLoading] = useState(false);
+  const [firstLoad, setFirstLoad] = useState(true);
   const [filter, setFilter] = useState<typeof FILTERS[number]>("all");
   const [expanded, setExpanded] = useState<string | null>(null);
 
@@ -45,6 +49,7 @@ export default function Signals() {
       Alert.alert("Error", e?.message || "Failed");
     } finally {
       setLoading(false);
+      setFirstLoad(false);
     }
   }, []);
 
@@ -57,11 +62,14 @@ export default function Signals() {
   );
 
   async function approve(sig: Signal) {
+    haptics.medium();
     try {
       await api("/trade/approve", { method: "POST", body: { signal_id: sig.id } });
+      haptics.success();
       Alert.alert("Approved", `Position opened on ${sig.market}.`);
       await load();
     } catch (e: any) {
+      haptics.error();
       Alert.alert("Failed", e?.message || "Try again");
     }
   }
@@ -83,7 +91,10 @@ export default function Signals() {
             <Pressable
               key={f}
               testID={`filter-${f}`}
-              onPress={() => setFilter(f)}
+              onPress={() => {
+                haptics.select();
+                setFilter(f);
+              }}
               style={[
                 styles.filterChip,
                 active && { borderColor: c, backgroundColor: hexAlpha(c, 0.1) },
@@ -104,21 +115,30 @@ export default function Signals() {
 
       <FlatList
         contentContainerStyle={styles.list}
-        data={filtered}
+        data={firstLoad ? [] : filtered}
         keyExtractor={(s) => s.id}
         refreshControl={
           <RefreshControl tintColor={colors.textTertiary} refreshing={loading} onRefresh={load} />
         }
         ListEmptyComponent={
-          <Text style={styles.empty}>No signals from this engine.</Text>
+          firstLoad ? (
+            <SignalsListSkeleton count={6} />
+          ) : (
+            <Text style={styles.empty}>No signals from this engine.</Text>
+          )
         }
-        renderItem={({ item }) => (
-          <SignalRow
-            sig={item}
-            expanded={expanded === item.id}
-            onToggle={() => setExpanded(expanded === item.id ? null : item.id)}
-            onApprove={() => approve(item)}
-          />
+        renderItem={({ item, index }) => (
+          <FadeSlideIn delay={Math.min(index, 6) * 40} distance={8}>
+            <SignalRow
+              sig={item}
+              expanded={expanded === item.id}
+              onToggle={() => {
+                haptics.light();
+                setExpanded(expanded === item.id ? null : item.id);
+              }}
+              onApprove={() => approve(item)}
+            />
+          </FadeSlideIn>
         )}
       />
     </SafeAreaView>

@@ -73,12 +73,15 @@ export default function Dashboard() {
 
   async function autoDeploy() {
     if (!data) return;
+    haptics.medium();
     setDeploying(true);
     try {
       const r = await api<{ deployed: any[] }>("/trade/auto-deploy", { method: "POST" });
+      haptics.success();
       Alert.alert("Deployed", `${r.deployed.length} position(s) opened.`);
       await load();
     } catch (e: any) {
+      haptics.error();
       Alert.alert("Deploy failed", e?.message || "Try again");
     } finally {
       setDeploying(false);
@@ -120,8 +123,10 @@ export default function Dashboard() {
             />
           </View>
         </View>
+        </FadeSlideIn>
 
         {/* Hero — Bankroll */}
+        <FadeSlideIn delay={80}>
         <View style={styles.hero}>
           <Text style={styles.heroLabel}>Bankroll · {user?.name?.toUpperCase() || "TRADER"}</Text>
           <MetricText
@@ -146,19 +151,26 @@ export default function Dashboard() {
             </Text>
           </View>
         </View>
+        </FadeSlideIn>
 
         {/* Engines — minimalist horizontal list */}
+        <FadeSlideIn delay={180}>
         <View style={styles.engineList}>
           {(data?.engine_status || PLACEHOLDER).map((e, i) => (
             <EngineRow key={e.engine} status={e} last={i === 3} />
           ))}
         </View>
+        </FadeSlideIn>
 
         {/* Top signal */}
         {data?.top_signal ? (
+          <FadeSlideIn delay={260}>
           <Pressable
             testID="top-signal-card"
-            onPress={() => router.push("/(tabs)/signals")}
+            onPress={() => {
+              haptics.select();
+              router.push("/(tabs)/signals");
+            }}
             style={styles.topSignalSection}
           >
             <View style={styles.sectionHeader}>
@@ -167,9 +179,11 @@ export default function Dashboard() {
             </View>
             <TopSignal sig={data.top_signal} />
           </Pressable>
+          </FadeSlideIn>
         ) : null}
 
         {/* Allocator CTA */}
+        <FadeSlideIn delay={340}>
         <View style={styles.allocSection}>
           <View style={styles.sectionHeader}>
             <Text style={styles.sectionLabel}>Master Allocator</Text>
@@ -204,6 +218,7 @@ export default function Dashboard() {
             <Feather name="arrow-up-right" size={16} color={colors.primaryText} />
           </Pressable>
         </View>
+        </FadeSlideIn>
 
         <View style={{ height: space.xl }} />
       </ScrollView>

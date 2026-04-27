@@ -11,6 +11,7 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { api } from "../../lib/api";
 import { colors, engineColor, space, type as typo } from "../../lib/theme";
 import { MetricText, formatUsd, pnlColor } from "../../lib/format";
+import { FadeSlideIn } from "../../components/Animated";
 
 type Position = {
   id: string;
@@ -75,14 +76,22 @@ export default function Positions() {
         {open.length === 0 ? (
           <Text style={styles.empty}>No open positions yet.</Text>
         ) : (
-          open.map((p) => <PositionCard key={p.id} pos={p} />)
+          open.map((p, i) => (
+            <FadeSlideIn key={p.id} delay={Math.min(i, 5) * 50} distance={8}>
+              <PositionCard pos={p} />
+            </FadeSlideIn>
+          ))
         )}
 
         <SectionLabel text="Closed" />
         {closed.length === 0 ? (
           <Text style={styles.empty}>No closed positions.</Text>
         ) : (
-          closed.map((p) => <PositionCard key={p.id} pos={p} />)
+          closed.map((p, i) => (
+            <FadeSlideIn key={p.id} delay={Math.min(i, 5) * 50} distance={8}>
+              <PositionCard pos={p} />
+            </FadeSlideIn>
+          ))
         )}
         <View style={{ height: space.xl }} />
       </ScrollView>

@@ -13,6 +13,8 @@ import { SafeAreaView } from "react-native-safe-area-context";
 import { Feather } from "@expo/vector-icons";
 import { api } from "../../lib/api";
 import { colors, hexAlpha, space, type as typo } from "../../lib/theme";
+import { haptics } from "../../lib/haptics";
+import { FadeSlideIn } from "../../components/Animated";
 
 type MicroSig = {
   id: string;
@@ -52,11 +54,14 @@ export default function MicroMode() {
   );
 
   async function execute(sig: MicroSig) {
+    haptics.medium();
     try {
       await api("/trade/approve", { method: "POST", body: { signal_id: sig.id } });
+      haptics.success();
       Alert.alert("Arb deployed", `Cross-venue arb opened on ${sig.market}`);
       await load();
     } catch (e: any) {
+      haptics.error();
       Alert.alert("Failed", e?.message || "Try again");
     }
   }
@@ -81,7 +86,11 @@ export default function MicroMode() {
         ListEmptyComponent={
           <Text style={styles.empty}>No arbitrage opportunities right now.</Text>
         }
-        renderItem={({ item }) => <ArbCard sig={item} onExecute={() => execute(item)} />}
+        renderItem={({ item, index }) => (
+          <FadeSlideIn delay={Math.min(index, 5) * 60} distance={10}>
+            <ArbCard sig={item} onExecute={() => execute(item)} />
+          </FadeSlideIn>
+        )}
       />
     </SafeAreaView>
   );

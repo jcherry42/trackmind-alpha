@@ -16,6 +16,8 @@ import { Feather } from "@expo/vector-icons";
 import * as LocalAuthentication from "expo-local-authentication";
 import { useAuth } from "../../lib/auth";
 import { colors, space, type as typo } from "../../lib/theme";
+import { haptics } from "../../lib/haptics";
+import { FadeSlideIn } from "../../components/Animated";
 
 export default function Login() {
   const { login } = useAuth();
@@ -28,6 +30,7 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null);
 
   async function onSubmit() {
+    haptics.light();
     setError(null);
     setLoading(true);
     try {
@@ -47,8 +50,10 @@ export default function Login() {
         }
       }
       await login(email.trim(), password);
+      haptics.success();
       router.replace("/(tabs)");
     } catch (e: any) {
+      haptics.error();
       setError(e?.message || "Login failed");
     } finally {
       setLoading(false);
@@ -65,17 +70,19 @@ export default function Login() {
           contentContainerStyle={styles.container}
           keyboardShouldPersistTaps="handled"
         >
-          <View style={styles.brand}>
-            <View style={styles.markRow}>
-              <View style={styles.markDot} />
-              <Text testID="brand-logo" style={styles.brandLogo}>
-                TRACKMIND
-              </Text>
+          <FadeSlideIn delay={60} distance={16}>
+            <View style={styles.brand}>
+              <View style={styles.markRow}>
+                <View style={styles.markDot} />
+                <Text testID="brand-logo" style={styles.brandLogo}>
+                  TRACKMIND
+                </Text>
+              </View>
+              <Text style={styles.brandTag}>Prediction market intelligence</Text>
             </View>
-            <Text style={styles.brandTag}>Prediction market intelligence</Text>
-          </View>
+          </FadeSlideIn>
 
-          <View style={styles.form}>
+          <FadeSlideIn delay={220} distance={20} style={styles.form}>
             <Field
               label="Email"
               testID="email-input"
@@ -166,7 +173,7 @@ export default function Login() {
               </Text>
               <Feather name="arrow-right" size={16} color={colors.primaryText} />
             </Pressable>
-          </View>
+          </FadeSlideIn>
 
           <View style={styles.footer}>
             <Link href="/(auth)/register" asChild>

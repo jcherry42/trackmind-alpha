@@ -41,6 +41,7 @@ export default function TabsLayout() {
         name="index"
         options={{
           title: "Dash",
+          tabBarButtonTestID: "tab-dash",
           tabBarIcon: ({ color }) => <Feather name="grid" color={color} size={18} />,
         }}
       />
@@ -48,6 +49,7 @@ export default function TabsLayout() {
         name="signals"
         options={{
           title: "Signals",
+          tabBarButtonTestID: "tab-signals",
           tabBarIcon: ({ color }) => <Feather name="zap" color={color} size={18} />,
         }}
       />
@@ -55,6 +57,7 @@ export default function TabsLayout() {
         name="positions"
         options={{
           title: "Positions",
+          tabBarButtonTestID: "tab-positions",
           tabBarIcon: ({ color }) => <Feather name="briefcase" color={color} size={18} />,
         }}
       />
@@ -62,6 +65,7 @@ export default function TabsLayout() {
         name="micro"
         options={{
           title: "Micro",
+          tabBarButtonTestID: "tab-micro",
           tabBarIcon: ({ color }) => <Feather name="git-merge" color={color} size={18} />,
         }}
       />
@@ -69,6 +73,7 @@ export default function TabsLayout() {
         name="analytics"
         options={{
           title: "Analytics",
+          tabBarButtonTestID: "tab-analytics",
           tabBarIcon: ({ color }) => <Feather name="trending-up" color={color} size={18} />,
         }}
       />
