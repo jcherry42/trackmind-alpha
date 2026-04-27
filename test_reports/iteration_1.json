@@ -1,0 +1,57 @@
+{
+  "summary": "Tested TRACKMIND end-to-end (backend + Expo web frontend). 19/19 backend pytest tests pass on first clean run covering auth, dashboard, signals (alpha/quant/whale/micro), trade approve, auto-deploy, positions, analytics, controls (pause/kill-switch/reset), and refresh. Frontend: fixed a CRITICAL bug — @react-native-async-storage/async-storage@3.0.2 was incompatible with Expo SDK and threw 'AsyncStorage.default.multiSet is not a function' at login, blocking the entire app. Downgraded to 2.2.0 (Expo-recommended) and login → dashboard → all 5 tabs (Dash/Signals/Positions/Micro/Analytics) → Controls modal → Settings modal → Logout → Register all work. Approve flow opens a position; allocator UI shows top signal + auto-deploy button; Bloomberg-dark theme renders cleanly. Alpha LLM signals are produced (8 signals, ~63% avg confidence). Quant=0 signals (expected per agent context).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {
+        "screen": "Tabs (all)",
+        "issues": [
+          "Bottom tab buttons have no testID — recommend adding `tabBarButtonTestID: 'tab-signals'` etc. on each Tabs.Screen for stable automation. Workaround used: navigate by URL."
+        ]
+      },
+      {
+        "screen": "Positions / Analytics",
+        "issues": [
+          "Position auto-settlement runs at ~7% per dashboard/positions tick which can immediately wipe a freshly-approved trade to a 100% loss (observed: -$1,507.50 right after approve). Intentional per spec, but feels jarring on first interaction — consider lowering probability or seeding a few minutes of mark-to-market before settlement is eligible."
+        ]
+      }
+    ],
+    "react_native_issues": [
+      {
+        "component": "package.json",
+        "issue": "Expo doctor reports several packages still off recommended versions: expo-haptics@55.0.14 (expected ~15.0.8), expo-local-authentication@55.0.13 (expected ~17.0.8), expo-secure-store@55.0.13 (expected ~15.0.8), react-native-svg@15.15.4 (expected 15.12.1). App runs but native builds may be flaky. Not blocking."
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_trackmind.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "(Optional) Add tabBarButtonTestID to each Tabs.Screen in /app/frontend/app/(tabs)/_layout.tsx for testable bottom-nav.",
+    "(Optional) Tune settle_open_positions probability or gate it behind N ticks so newly-approved positions don't instantly close.",
+    "(Optional) Run `npx expo install --fix` to align expo-haptics / expo-local-authentication / expo-secure-store / react-native-svg with installed Expo SDK."
+  ],
+  "critical_code_review_comments": [
+    "server.py is 820 lines — fine for now but split into routers/{auth,trade,controls,analytics}.py if it grows further.",
+    "MongoDB ObjectId is correctly excluded — public_user() returns id as str(_id) and _serialize_position strips _id. Good.",
+    "Auth uses bcrypt + JWT HS256, brute-force lockout (5 attempts/15 min), refresh token rotation — solid.",
+    "CORS is allow_origins=['*'] with allow_credentials=False — acceptable for mobile Bearer auth, but cookies set via httponly will not work cross-site for a future web client. Document this if a web build is planned."
+  ],
+  "updated_files": [
+    "/app/frontend/package.json (downgraded @react-native-async-storage/async-storage 3.0.2 → 2.2.0)",
+    "/app/frontend/yarn.lock",
+    "/app/backend/tests/test_trackmind.py (created)"
+  ],
+  "success_rate": {"backend": "100% (19/19)", "frontend": "100% (all visited screens functional)"},
+  "seed_data_creation": "Admin user auto-seeded by backend on startup; test_trackmind.py creates one TEST_Trader user per run via /api/auth/register (ephemeral but accumulating in DB — acceptable for paper).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Backend URL: https://trackmind-alpha.preview.emergentagent.com. Admin admin@trackmind.io / Admin123!. Run pytest /app/backend/tests/test_trackmind.py -v for full regression. Engine cache refreshes every 60s (signal IDs include minute bucket: sig_<engine>_<canonical_id>_<minute>). Quant intentionally emits 0 signals on first refresh. Frontend: login button shows AsyncStorage error if @react-native-async-storage/async-storage is not at 2.2.0. After login, tabs navigate via /signals /positions /micro /analytics URLs (no testID on tab buttons).",
+  "rca_of_issue": "Login was completely broken on web because @react-native-async-storage/async-storage was pinned to 3.0.2 in package.json. RN-AsyncStorage 3.x removed the legacy `default.multiSet` exposure that lib/api.ts relies on (`AsyncStorage.multiSet([...])`), and 3.x is also incompatible with the installed Expo SDK (expected 2.2.0 per `npx expo-doctor`). Fix: `yarn add @react-native-async-storage/async-storage@2.2.0` then `sudo supervisorctl restart expo`. Verified login → dashboard works after fix."
+}
