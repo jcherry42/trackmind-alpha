@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    networks: [trackmind]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [trackmind]
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: ../infra/backend.Dockerfile
+    environment:
+      MONGO_URL: mongodb://mongo:27017
+      DB_NAME: trackmind_db
+      JWT_SECRET: ${JWT_SECRET:-change_me_in_prod}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@trackmind.io}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-Admin123!}
+      EMERGENT_LLM_KEY: ${EMERGENT_LLM_KEY}
+    depends_on: [mongo, redis]
+    ports: ["8001:8001"]
+    networks: [trackmind]
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on: [api]
+    ports: ["80:80"]
+    networks: [trackmind]
+
+volumes:
+  mongo_data:
+
+networks:
+  trackmind:
+    driver: bridge

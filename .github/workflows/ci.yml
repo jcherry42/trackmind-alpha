@@ -1,0 +1,43 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      mongo:
+        image: mongo:7
+        ports: ["27017:27017"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pip install -r backend/requirements.txt apscheduler pytest httpx
+      - run: |
+          cd backend
+          MONGO_URL=mongodb://localhost:27017 \
+          DB_NAME=trackmind_test \
+          JWT_SECRET=ci_secret \
+          ADMIN_EMAIL=admin@trackmind.io \
+          ADMIN_PASSWORD=Admin123! \
+          pytest -q tests/
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - run: corepack enable && yarn --cwd frontend install --frozen-lockfile
+      - run: yarn --cwd frontend lint || true
+
+  build:
+    needs: [backend, frontend]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose -f infra/docker-compose.yml build api
