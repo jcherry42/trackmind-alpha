@@ -395,6 +395,11 @@ async def refresh_engines() -> None:
     whale_signals = whale_engine.run()
     micro_signals = micro_engine.run()
 
+    # After signals are computed below, attempt to fan out a master-signal alert.
+    # This runs at the END of refresh_engines (deferred via asyncio.create_task) so
+    # we don't block the engine refresh on push delivery.
+    asyncio.create_task(_maybe_send_master_signal_alert())
+
     all_signals: List[dict] = []
     by_engine: Dict[str, List[dict]] = {"alpha": [], "quant": [], "whale": [], "micro": []}
     by_id: Dict[str, dict] = {}
@@ -1274,6 +1279,104 @@ async def _current_llm_quota_snapshot(user: dict) -> dict:
 async def me_quota(user: dict = Depends(get_current_user)):
     """Return the caller's LLM quota + today's usage."""
     return await _current_llm_quota_snapshot(user)
+
+
+# ---------- push notifications ----------
+class PushTokenIn(BaseModel):
+    token: str
+    platform: Optional[str] = None  # "ios" | "android" | "web"
+
+
+@api.post("/me/push-token")
+async def register_push_token(payload: PushTokenIn, user: dict = Depends(get_current_user)):
+    """Idempotently store the device's Expo push token under the user's profile."""
+    if not payload.token:
+        raise HTTPException(status_code=400, detail="token is required")
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {
+            "$addToSet": {
+                "push_tokens": {
+                    "token": payload.token,
+                    "platform": payload.platform or "unknown",
+                    "added_at": datetime.now(timezone.utc).isoformat(),
+                }
+            }
+        },
+    )
+    await audit(str(user["_id"]), "push.register", {"platform": payload.platform})
+    return {"ok": True}
+
+
+@api.delete("/me/push-token")
+async def remove_push_token(payload: PushTokenIn, user: dict = Depends(get_current_user)):
+    """Remove a single device push token (e.g. on logout from that device)."""
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        {"$pull": {"push_tokens": {"token": payload.token}}},
+    )
+    return {"ok": True}
+
+
+# Serial state for the "master signal" alert deduper.
+_master_signal_state: Dict[str, Any] = {"last_id": None, "last_ts": 0.0}
+MASTER_SIGNAL_THRESHOLD = float(os.environ.get("MASTER_SIGNAL_THRESHOLD", "0.65"))  # confidence × edge_norm
+MASTER_SIGNAL_COOLDOWN_SEC = int(os.environ.get("MASTER_SIGNAL_COOLDOWN_SEC", "1200"))  # 20 min
+
+
+async def _maybe_send_master_signal_alert() -> None:
+    """If the strongest current signal crosses the threshold, fan out a push to all users.
+
+    Deduped by signal id + cooldown so we don't spam.
+    """
+    async with _engine_cache_lock:
+        signals = list(_engine_cache["signals"])
+    if not signals:
+        return
+    top = max(
+        signals,
+        key=lambda s: float(s.get("confidence", 0)) * float(s.get("expected_edge", 0)) * 10,
+    )
+    score = float(top.get("confidence", 0)) * float(top.get("expected_edge", 0)) * 10
+    if score < MASTER_SIGNAL_THRESHOLD:
+        return
+    now = time.time()
+    if (
+        _master_signal_state["last_id"] == top["id"]
+        and (now - _master_signal_state["last_ts"]) < MASTER_SIGNAL_COOLDOWN_SEC
+    ):
+        return
+    _master_signal_state["last_id"] = top["id"]
+    _master_signal_state["last_ts"] = now
+
+    # Collect all distinct push tokens.
+    tokens: List[str] = []
+    async for u in db.users.find({"push_tokens.0": {"$exists": True}}):
+        for t in u.get("push_tokens", []) or []:
+            if isinstance(t, dict) and t.get("token"):
+                tokens.append(t["token"])
+    if not tokens:
+        return
+
+    title = f"MASTER SIGNAL · {top['engine'].upper()} {top['side']}"
+    body = f"{top['market'][:80]} · conf {int(top['confidence']*100)}% · edge +{top['expected_edge']*100:.1f}%"
+    try:
+        from push import send_to_tokens
+        result = await send_to_tokens(
+            tokens,
+            title,
+            body,
+            data={"signal_id": top["id"], "engine": top["engine"], "kind": "master_signal"},
+        )
+        # Prune any tokens Expo flagged as no-longer-registered.
+        for bad in result.get("invalid_tokens", []):
+            await db.users.update_many({}, {"$pull": {"push_tokens": {"token": bad}}})
+        logger.info(
+            "master_signal_alert_sent",
+            extra={"signal_id": top["id"], "engine": top["engine"], "delivered": result["ok"]},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"master signal alert error: {e}")
 
 
 @api.get("/admin/audit")

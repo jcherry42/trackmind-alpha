@@ -16,6 +16,7 @@ import { useAuth } from "../lib/auth";
 import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { ProgressBar } from "../components/ProgressBar";
+import { useSnackbar } from "../components/Snackbar";
 import { colors, radius, space, type as typo } from "../lib/theme";
 import { formatUsd } from "../lib/format";
 
@@ -30,6 +31,7 @@ type Quota = {
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
   const router = useRouter();
+  const snack = useSnackbar();
   const [busy, setBusy] = useState(false);
   const [quota, setQuota] = useState<Quota | null>(null);
 
@@ -157,10 +159,16 @@ export default function SettingsScreen() {
               value={!!user?.live_mode}
               onValueChange={(v) => {
                 if (v) {
-                  Alert.alert(
-                    "Live mode unavailable",
-                    "Live execution requires venue API keys. Paper mode remains active."
-                  );
+                  snack.show({
+                    message: "Live mode unavailable in paper-only build.",
+                    kind: "warning",
+                    action: { label: "Why", onPress: () =>
+                      Alert.alert(
+                        "Live mode",
+                        "Live execution requires venue API keys (Polymarket/Kalshi). Paper mode remains active."
+                      )
+                    },
+                  });
                   return;
                 }
                 setFlag("live_mode", v);

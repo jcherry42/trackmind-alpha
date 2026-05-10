@@ -623,3 +623,49 @@ phase4:
       - working: "NA"
         agent: "main"
         comment: "Reworked CI: backend job runs ruff + pytest unit + integration (with mongo service container); frontend job runs tsc --noEmit (blocking) + jest test:ci (blocking) + eslint (non-blocking); docker-build runs after both. k6 loadtest as separate workflow_dispatch job."
+
+phase5:
+  - task: "Phase 5 — Snackbar (toast) system with action buttons"
+    implemented: true
+    working: true
+    file: "frontend/components/Snackbar.tsx, frontend/app/_layout.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Provider+hook+animated bar with reanimated; success/error/info/warning kinds with icon + tinted action button. Auto-dismiss after 3.5s (configurable). Replaces Alert.alert globally."
+  - task: "Phase 5 — Push notifications (mobile) + Expo token registration"
+    implemented: true
+    working: true
+    file: "frontend/components/PushBootstrap.tsx, backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "PushBootstrap mounted near AuthProvider; requests permission, fetches Expo token, POSTs to /api/me/push-token (idempotent, $addToSet). DELETE /api/me/push-token for logout. Verified end-to-end."
+  - task: "Phase 5 — Master Signal alert fan-out"
+    implemented: true
+    working: true
+    file: "backend/push.py, backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Each refresh_engines tick spawns a deferred coroutine that, if top signal score >= MASTER_SIGNAL_THRESHOLD (env, default 0.65) AND last alert was for a different signal OR > MASTER_SIGNAL_COOLDOWN_SEC (default 1200) ago, sends Expo push to every user with stored tokens. Invalid tokens auto-pruned."
+  - task: "Phase 5 — Privacy + Terms screens (placeholder text)"
+    implemented: true
+    working: true
+    file: "frontend/app/legal/privacy.tsx, frontend/app/legal/terms.tsx"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Modal screens registered in root Stack. Settings has links. Drafted placeholder text covers: who we are, data collected, sharing, retention, security, rights, eligibility, paper-vs-live, no investment advice, acceptable use, fees, termination, disclaimers, governing law, contacts."
