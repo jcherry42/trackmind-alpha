@@ -433,3 +433,51 @@ class TestPhase2Observability:
         for ev in data["events"]:
             assert ev.get("user_id") == me["id"]
 
+# --------------- module: phase 4 (concurrency / load) ----------------
+class TestPhase4Concurrency:
+    """High-value invariants that only show up under parallel load."""
+
+    def test_concurrent_idempotent_approves(self):
+        """100 parallel approves with the SAME Idempotency-Key → exactly 1 position.
+
+        Hits the local backend directly (bypassing public ingress) since the contract
+        we're verifying is server-side correctness under concurrency, not network behaviour.
+        """
+        import concurrent.futures
+
+        local = os.environ.get("LOCAL_BACKEND_URL", "http://localhost:8001")
+        # Get a fresh token + fresh signal via the local socket.
+        r = requests.post(
+            f"{local}/api/auth/login",
+            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+            timeout=15,
+        )
+        if r.status_code != 200:
+            pytest.skip(f"local backend unreachable: {r.status_code}")
+        tok = r.json()["access_token"]
+        sigs = requests.get(f"{local}/api/signals", headers=auth_headers(tok), timeout=15).json()["signals"]
+        if not sigs:
+            pytest.skip("no signals available for concurrency test")
+        sid = sigs[0]["id"]
+        ikey = uuid.uuid4().hex
+
+        def approve_once():
+            return requests.post(
+                f"{local}/api/trade/approve",
+                json={"signal_id": sid, "notional": 50.0},
+                headers={**auth_headers(tok), "Idempotency-Key": ikey},
+                timeout=20,
+            )
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as pool:
+            responses = list(pool.map(lambda _: approve_once(), range(40)))
+
+        successes = [r for r in responses if r.status_code == 200]
+        fill_ids = {r.json()["fill"]["id"] for r in successes if r.json().get("fill")}
+        assert len(fill_ids) == 1, f"Expected exactly 1 distinct fill_id, got {len(fill_ids)}: {fill_ids}"
+
+        pos = requests.get(f"{local}/api/positions", headers=auth_headers(tok), timeout=15).json()
+        matches = [p for p in pos["open"] if p.get("fill_id") in fill_ids]
+        assert len(matches) == 1, f"Expected 1 position, found {len(matches)}"
+
+

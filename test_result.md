@@ -552,3 +552,74 @@ agent_communication:
 
       Updated test_result.md: all 4 Phase 2 backend tasks now
       working: true, needs_retesting: false.
+
+phase4:
+  - task: "Phase 4 — Atomic claim-first idempotency (race fix)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: false
+        agent: "main"
+        comment: "Initial impl (read-then-write) leaked: 100 concurrent approves with same key produced 30 distinct fills (race condition)."
+      - working: true
+        agent: "main"
+        comment: "Rewritten with findOneAndUpdate+$setOnInsert claim, in-flight wait, abort-on-error. Verified: 40 concurrent approves with identical Idempotency-Key now yield exactly 1 distinct fill_id and 1 position."
+  - task: "Phase 4 — Frontend Jest unit tests (api / format / ErrorBoundary)"
+    implemented: true
+    working: true
+    file: "frontend/{components,lib}/__tests__/*"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "18/18 jest tests green: format (10), api (5: bearer header, idempotency-key auto-attach, error throwing, 401 refresh-and-retry, ApiError shape), ErrorBoundary (2: renders children / shows fallback)."
+  - task: "Phase 4 — Backend unit tests (allocator + engines)"
+    implemented: true
+    working: true
+    file: "backend/tests/test_units.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "9/9 deterministic unit tests green: allocator (5: empty plan, bankroll cap, paused exclusion, drawdown scaling, near-limit clamp), quant engine (2: shape + determinism), whale (1), micro (1)."
+  - task: "Phase 4 — Concurrent idempotency integration test"
+    implemented: true
+    working: true
+    file: "backend/tests/test_trackmind.py::TestPhase4Concurrency"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "40 concurrent ThreadPool approves with same Idempotency-Key → asserts len(distinct fill_ids)==1 and len(matching positions)==1. Hits LOCAL_BACKEND_URL (default localhost:8001) to avoid ingress throttling."
+  - task: "Phase 4 — k6 load test scenario"
+    implemented: true
+    working: "NA"
+    file: "tests/load/approve_idempotency.js"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "100 VU thundering-herd test scenario. Wired into ci.yml under workflow_dispatch trigger (manual)."
+  - task: "Phase 4 — CI hardened (tsc + jest + ruff + pytest blocking)"
+    implemented: true
+    working: "NA"
+    file: ".github/workflows/ci.yml"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: "Reworked CI: backend job runs ruff + pytest unit + integration (with mongo service container); frontend job runs tsc --noEmit (blocking) + jest test:ci (blocking) + eslint (non-blocking); docker-build runs after both. k6 loadtest as separate workflow_dispatch job."

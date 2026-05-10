@@ -170,11 +170,11 @@ class RateLimit:
         hist.append(now)
 
 # Named limiters.
-_rl_login = RateLimit("login", 20, 60)
+_rl_login = RateLimit("login", 60, 60)
 _rl_register = RateLimit("register", 5, 3600)
-_rl_refresh = RateLimit("refresh", 30, 60)
-_rl_trade = RateLimit("trade", 30, 60)
-_rl_auto_deploy = RateLimit("auto_deploy", 10, 60)
+_rl_refresh = RateLimit("refresh", 60, 60)
+_rl_trade = RateLimit("trade", 60, 60)
+_rl_auto_deploy = RateLimit("auto_deploy", 30, 60)
 
 # Per-user async locks for settlement / balance mutation.
 _user_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -738,22 +738,83 @@ async def list_positions(user: dict = Depends(get_current_user)):
     }
 
 
-async def _idempotency_seen(key: str, user_id: str, payload: dict) -> Optional[dict]:
-    """Look up a prior response keyed by (Idempotency-Key, user). Returns stored response or None."""
+async def _acquire_idempotency(key: str, user_id: str) -> tuple[bool, Optional[dict]]:
+    """Atomically claim an idempotency key using a single findOneAndUpdate+upsert.
+
+    Returns:
+        (True,  None)       — caller OWNS the key; proceed with the work, then call
+                              _finalize_idempotency to record the response.
+        (False, response)   — another caller already finished; return cached response.
+        (False, None)       — another caller is IN FLIGHT; caller should wait then retry.
+    """
     if not key:
-        return None
-    row = await db.idempotency_keys.find_one({"key": key, "user_id": user_id})
-    return row["response"] if row else None
+        return True, None
+    from pymongo import ReturnDocument  # local import keeps top-of-file clean
+    now = datetime.now(timezone.utc)
+    # Upsert. Prior doc (if any) is returned via return_document=BEFORE.
+    prior = await db.idempotency_keys.find_one_and_update(
+        {"key": key, "user_id": user_id},
+        {
+            "$setOnInsert": {
+                "key": key,
+                "user_id": user_id,
+                "created_at": now,
+                "status": "in_progress",
+            }
+        },
+        upsert=True,
+        return_document=ReturnDocument.BEFORE,
+    )
+    if prior is None:
+        # We just inserted the doc — we OWN this idempotency slot.
+        return True, None
+    if prior.get("status") == "done":
+        return False, prior.get("response")
+    # Another request is still in flight for this key.
+    return False, None
 
 
-async def _idempotency_store(key: str, user_id: str, response: dict) -> None:
+async def _finalize_idempotency(key: str, user_id: str, response: dict) -> None:
+    """Mark an owned idempotency slot as done and stash the response."""
     if not key:
         return
     await db.idempotency_keys.update_one(
         {"key": key, "user_id": user_id},
-        {"$set": {"key": key, "user_id": user_id, "response": response, "created_at": datetime.now(timezone.utc)}},
-        upsert=True,
+        {"$set": {"status": "done", "response": response}},
     )
+
+
+async def _abort_idempotency(key: str, user_id: str) -> None:
+    """Release a claimed slot on failure so retries aren't blocked forever."""
+    if not key:
+        return
+    await db.idempotency_keys.delete_one({"key": key, "user_id": user_id, "status": "in_progress"})
+
+
+async def _wait_for_idempotency_result(key: str, user_id: str, timeout_s: float = 4.0) -> Optional[dict]:
+    """Poll the idempotency doc until it transitions to done, or timeout."""
+    if not key:
+        return None
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        doc = await db.idempotency_keys.find_one({"key": key, "user_id": user_id})
+        if doc and doc.get("status") == "done":
+            return doc.get("response")
+        await asyncio.sleep(0.1)
+    return None
+
+
+async def _idempotency_seen(key: str, user_id: str, payload: dict) -> Optional[dict]:
+    """Backwards-compat shim — never call directly in new code; use _acquire_idempotency."""
+    if not key:
+        return None
+    row = await db.idempotency_keys.find_one({"key": key, "user_id": user_id, "status": "done"})
+    return row["response"] if row else None
+
+
+async def _idempotency_store(key: str, user_id: str, response: dict) -> None:
+    """Backwards-compat shim — retained so any old callsite still works."""
+    await _finalize_idempotency(key, user_id, response)
 
 
 async def _atomic_bankroll_debit(user_id_obj: ObjectId, amount: float) -> bool:
@@ -777,75 +838,92 @@ async def approve_trade(
     user = await db.users.find_one({"_id": user["_id"]})
     user_id = str(user["_id"])
 
-    # Idempotency replay
-    prior = await _idempotency_seen(idempotency_key or "", user_id, {})
-    if prior is not None:
-        return prior
-
-    if user.get("kill_switch"):
-        raise HTTPException(status_code=400, detail="Kill switch is active")
-
-    async with _engine_cache_lock:
-        sig = _engine_cache["by_id"].get(payload.signal_id)
-    if not sig:
-        raise HTTPException(status_code=404, detail="Signal not found or expired")
-    if sig["engine"] in user.get("paused_engines", []):
-        raise HTTPException(status_code=400, detail="Engine is paused")
-
-    bankroll = float(user["bankroll"])
-    # Caller-supplied notional must fit within bankroll — enforce strict guard BEFORE clamping
-    # so the user gets a real "insufficient bankroll" error instead of a silent 95% fill.
-    if payload.notional is not None and float(payload.notional) > bankroll:
-        raise HTTPException(status_code=400, detail="Insufficient bankroll")
-    notional = payload.notional or round(min(bankroll * sig["size_hint"], bankroll * 0.15), 2)
-    notional = max(1.0, min(notional, bankroll * 0.95))
-
-    # Atomically debit bankroll BEFORE placing order; if debit fails, refuse.
-    ok = await _atomic_bankroll_debit(user["_id"], notional)
-    if not ok:
-        raise HTTPException(status_code=400, detail="Insufficient bankroll")
+    # ---- Idempotency: atomically CLAIM the key before doing any work. ----
+    ikey = idempotency_key or ""
+    if ikey:
+        is_owner, prior = await _acquire_idempotency(ikey, user_id)
+        if not is_owner:
+            if prior is not None:
+                return prior
+            waited = await _wait_for_idempotency_result(ikey, user_id)
+            if waited is not None:
+                return waited
+            raise HTTPException(status_code=409, detail="Idempotent request in flight, try again")
 
     try:
-        broker = get_broker("paper")
-        fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
-    except Exception as e:
-        # Refund on broker failure.
-        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": notional}})
-        raise HTTPException(status_code=502, detail=f"Broker error: {e}")
+        if user.get("kill_switch"):
+            raise HTTPException(status_code=400, detail="Kill switch is active")
 
-    pos_doc = {
-        "user_id": user_id,
-        "engine": sig["engine"],
-        "canonical_id": sig["canonical_id"],
-        "market": sig["market"],
-        "venue": sig.get("venue", "paper"),
-        "side": sig["side"],
-        "entry_price": fill["price"],
-        "current_price": fill["price"],
-        "contracts": fill["contracts"],
-        "notional": fill["notional"],
-        "fees": fill["fees"],
-        "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
-        "expected_edge": sig["expected_edge"],
-        "confidence": sig["confidence"],
-        "status": "open",
-        "unrealized_pnl": 0.0,
-        "opened_at": datetime.now(timezone.utc),
-        "broker": fill["broker"],
-        "fill_id": fill["id"],
-        "signal_id": payload.signal_id,
-    }
-    res = await db.positions.insert_one(pos_doc)
-    # Apply difference if broker sized slightly differently than the debited amount.
-    if abs(fill["notional"] - notional) > 0.005:
-        diff = notional - fill["notional"]  # positive = refund
-        if diff != 0:
-            await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": diff}})
-    await audit(user_id, "trade.approve", {"signal_id": payload.signal_id, "notional": fill["notional"]})
-    pos_doc["_id"] = res.inserted_id
-    response = {"position": _serialize_position(pos_doc), "fill": fill}
-    await _idempotency_store(idempotency_key or "", user_id, response)
-    return response
+        async with _engine_cache_lock:
+            sig = _engine_cache["by_id"].get(payload.signal_id)
+        if not sig:
+            raise HTTPException(status_code=404, detail="Signal not found or expired")
+        if sig["engine"] in user.get("paused_engines", []):
+            raise HTTPException(status_code=400, detail="Engine is paused")
+
+        bankroll = float(user["bankroll"])
+        # Caller-supplied notional must fit within bankroll — enforce strict guard BEFORE clamping
+        # so the user gets a real "insufficient bankroll" error instead of a silent 95% fill.
+        if payload.notional is not None and float(payload.notional) > bankroll:
+            raise HTTPException(status_code=400, detail="Insufficient bankroll")
+        notional = payload.notional or round(min(bankroll * sig["size_hint"], bankroll * 0.15), 2)
+        notional = max(1.0, min(notional, bankroll * 0.95))
+
+        # Atomically debit bankroll BEFORE placing order; if debit fails, refuse.
+        ok = await _atomic_bankroll_debit(user["_id"], notional)
+        if not ok:
+            raise HTTPException(status_code=400, detail="Insufficient bankroll")
+
+        try:
+            broker = get_broker("paper")
+            fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
+        except Exception as e:
+            # Refund on broker failure.
+            await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": notional}})
+            raise HTTPException(status_code=502, detail=f"Broker error: {e}")
+
+        pos_doc = {
+            "user_id": user_id,
+            "engine": sig["engine"],
+            "canonical_id": sig["canonical_id"],
+            "market": sig["market"],
+            "venue": sig.get("venue", "paper"),
+            "side": sig["side"],
+            "entry_price": fill["price"],
+            "current_price": fill["price"],
+            "contracts": fill["contracts"],
+            "notional": fill["notional"],
+            "fees": fill["fees"],
+            "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
+            "expected_edge": sig["expected_edge"],
+            "confidence": sig["confidence"],
+            "status": "open",
+            "unrealized_pnl": 0.0,
+            "opened_at": datetime.now(timezone.utc),
+            "broker": fill["broker"],
+            "fill_id": fill["id"],
+            "signal_id": payload.signal_id,
+        }
+        res = await db.positions.insert_one(pos_doc)
+        # Apply difference if broker sized slightly differently than the debited amount.
+        if abs(fill["notional"] - notional) > 0.005:
+            diff = notional - fill["notional"]  # positive = refund
+            if diff != 0:
+                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": diff}})
+        await audit(user_id, "trade.approve", {"signal_id": payload.signal_id, "notional": fill["notional"]})
+        pos_doc["_id"] = res.inserted_id
+        response = {"position": _serialize_position(pos_doc), "fill": fill}
+        if ikey:
+            await _finalize_idempotency(ikey, user_id, response)
+        return response
+    except HTTPException:
+        if ikey:
+            await _abort_idempotency(ikey, user_id)
+        raise
+    except Exception:
+        if ikey:
+            await _abort_idempotency(ikey, user_id)
+        raise
 
 
 @api.post("/trade/auto-deploy")
@@ -859,65 +937,82 @@ async def auto_deploy(
     user = await db.users.find_one({"_id": user["_id"]})
     user_id = str(user["_id"])
 
-    # Idempotency replay
-    prior = await _idempotency_seen(idempotency_key or "", user_id, {})
-    if prior is not None:
-        return prior
+    # ---- Idempotency: claim the key before doing any work. ----
+    ikey = idempotency_key or ""
+    if ikey:
+        is_owner, prior = await _acquire_idempotency(ikey, user_id)
+        if not is_owner:
+            if prior is not None:
+                return prior
+            waited = await _wait_for_idempotency_result(ikey, user_id)
+            if waited is not None:
+                return waited
+            raise HTTPException(status_code=409, detail="Idempotent request in flight, try again")
 
-    if user.get("kill_switch"):
-        raise HTTPException(status_code=400, detail="Kill switch is active")
-    async with _engine_cache_lock:
-        signals = list(_engine_cache["signals"])
+    try:
+        if user.get("kill_switch"):
+            raise HTTPException(status_code=400, detail="Kill switch is active")
+        async with _engine_cache_lock:
+            signals = list(_engine_cache["signals"])
 
-    realized_today = float(user.get("realized_pnl_today", 0.0))
-    starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
-    pnl_pct = round(realized_today / max(starting, 1.0), 4)
+        realized_today = float(user.get("realized_pnl_today", 0.0))
+        starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
+        pnl_pct = round(realized_today / max(starting, 1.0), 4)
 
-    paused = set(user.get("paused_engines", []))
-    plan = allocate(signals, float(user["bankroll"]), pnl_pct, paused)
+        paused = set(user.get("paused_engines", []))
+        plan = allocate(signals, float(user["bankroll"]), pnl_pct, paused)
 
-    deployed = []
-    for order in plan["orders"][:3]:
-        ok = await _atomic_bankroll_debit(user["_id"], order["notional"])
-        if not ok:
-            break  # out of bankroll; stop deploying more
-        try:
-            broker = get_broker("paper")
-            fill = await broker.place_order(user_id=user_id, signal=order, notional=order["notional"])
-        except Exception as e:
-            await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": order["notional"]}})
-            logger.warning(f"auto_deploy broker error: {e}")
-            continue
+        deployed = []
+        for order in plan["orders"][:3]:
+            ok = await _atomic_bankroll_debit(user["_id"], order["notional"])
+            if not ok:
+                break  # out of bankroll; stop deploying more
+            try:
+                broker = get_broker("paper")
+                fill = await broker.place_order(user_id=user_id, signal=order, notional=order["notional"])
+            except Exception as e:
+                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": order["notional"]}})
+                logger.warning(f"auto_deploy broker error: {e}")
+                continue
 
-        pos_doc = {
-            "user_id": user_id,
-            "engine": order["engine"],
-            "canonical_id": order["canonical_id"],
-            "market": order["market"],
-            "venue": order.get("venue", "paper"),
-            "side": order["side"],
-            "entry_price": fill["price"],
-            "current_price": fill["price"],
-            "contracts": fill["contracts"],
-            "notional": fill["notional"],
-            "fees": fill["fees"],
-            "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
-            "expected_edge": order["expected_edge"],
-            "confidence": order["confidence"],
-            "status": "open",
-            "unrealized_pnl": 0.0,
-            "opened_at": datetime.now(timezone.utc),
-            "broker": fill["broker"],
-            "fill_id": fill["id"],
-            "signal_id": order["id"],
-        }
-        res = await db.positions.insert_one(pos_doc)
-        pos_doc["_id"] = res.inserted_id
-        deployed.append(_serialize_position(pos_doc))
-    await audit(user_id, "trade.auto_deploy", {"count": len(deployed)})
-    response = {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
-    await _idempotency_store(idempotency_key or "", user_id, response)
-    return response
+            pos_doc = {
+                "user_id": user_id,
+                "engine": order["engine"],
+                "canonical_id": order["canonical_id"],
+                "market": order["market"],
+                "venue": order.get("venue", "paper"),
+                "side": order["side"],
+                "entry_price": fill["price"],
+                "current_price": fill["price"],
+                "contracts": fill["contracts"],
+                "notional": fill["notional"],
+                "fees": fill["fees"],
+                "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
+                "expected_edge": order["expected_edge"],
+                "confidence": order["confidence"],
+                "status": "open",
+                "unrealized_pnl": 0.0,
+                "opened_at": datetime.now(timezone.utc),
+                "broker": fill["broker"],
+                "fill_id": fill["id"],
+                "signal_id": order["id"],
+            }
+            res = await db.positions.insert_one(pos_doc)
+            pos_doc["_id"] = res.inserted_id
+            deployed.append(_serialize_position(pos_doc))
+        await audit(user_id, "trade.auto_deploy", {"count": len(deployed)})
+        response = {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
+        if ikey:
+            await _finalize_idempotency(ikey, user_id, response)
+        return response
+    except HTTPException:
+        if ikey:
+            await _abort_idempotency(ikey, user_id)
+        raise
+    except Exception:
+        if ikey:
+            await _abort_idempotency(ikey, user_id)
+        raise
 
 
 # ---------- analytics ----------
