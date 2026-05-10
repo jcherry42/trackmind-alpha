@@ -40,7 +40,8 @@ from pydantic import BaseModel, EmailStr, Field
 from markets import market_store, quote_to_dict
 from allocator import RiskConfig, allocate
 from engines import alpha as alpha_engine, quant as quant_engine, whale as whale_engine, micro as micro_engine
-from broker import get_broker
+from broker import get_broker, resolve_broker_for_user, is_live_configured
+from live_market import LIVE_INGEST_ENABLED, ingest_forever
 from observability import (
     configure_json_logging,
     request_id_var,
@@ -880,7 +881,7 @@ async def approve_trade(
             raise HTTPException(status_code=400, detail="Insufficient bankroll")
 
         try:
-            broker = get_broker("paper")
+            broker = resolve_broker_for_user(user)
             fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
         except Exception as e:
             # Refund on broker failure.
@@ -973,7 +974,7 @@ async def auto_deploy(
             if not ok:
                 break  # out of bankroll; stop deploying more
             try:
-                broker = get_broker("paper")
+                broker = resolve_broker_for_user(user)
                 fill = await broker.place_order(user_id=user_id, signal=order, notional=order["notional"])
             except Exception as e:
                 await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": order["notional"]}})
@@ -1281,6 +1282,44 @@ async def me_quota(user: dict = Depends(get_current_user)):
     return await _current_llm_quota_snapshot(user)
 
 
+@api.get("/brokers/status")
+async def brokers_status(user: dict = Depends(get_current_user)):
+    """Report which live brokers are configured on the server.
+
+    Lets the mobile app reflect a "Live mode unavailable for X" badge accurately
+    without exposing any credentials.
+    """
+    return {
+        "live_ingest": LIVE_INGEST_ENABLED,
+        "venues": {
+            "polymarket": {"configured": is_live_configured("polymarket")},
+            "kalshi": {"configured": is_live_configured("kalshi")},
+        },
+        "current_user": {
+            "live_mode": bool(user.get("live_mode")),
+            "live_broker": user.get("live_broker") or None,
+        },
+    }
+
+
+class LiveBrokerIn(BaseModel):
+    broker: Optional[str] = None  # "polymarket" | "kalshi" | null to clear
+
+
+@api.patch("/me/live-broker")
+async def set_live_broker(payload: LiveBrokerIn, user: dict = Depends(get_current_user)):
+    """Choose the venue routed to when live_mode is on. Refuses values whose env isn't ready."""
+    desired = (payload.broker or "").lower() or None
+    if desired and desired not in ("polymarket", "kalshi"):
+        raise HTTPException(status_code=400, detail="broker must be 'polymarket', 'kalshi', or null")
+    if desired and not is_live_configured(desired):
+        raise HTTPException(status_code=400, detail=f"{desired} not configured on server")
+    await db.users.update_one({"_id": user["_id"]}, {"$set": {"live_broker": desired}})
+    await audit(str(user["_id"]), "user.live_broker_set", {"broker": desired})
+    return {"ok": True, "live_broker": desired}
+
+
+
 # ---------- push notifications ----------
 class PushTokenIn(BaseModel):
     token: str
@@ -1453,6 +1492,11 @@ async def on_startup():
     except Exception:
         pass
     await db.audit_logs.create_index("ts", expireAfterSeconds=60 * 60 * 24 * 30, name="audit_ttl")
+
+    # Optional live ingest. Off by default; flip LIVE_INGEST_ENABLED=true to enable.
+    if LIVE_INGEST_ENABLED:
+        asyncio.create_task(ingest_forever())
+        logger.info("live ingest task scheduled")
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trackmind.io")
