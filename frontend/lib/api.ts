@@ -5,7 +5,7 @@ import { Platform } from "react-native";
 const BASE = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 
 export type ApiOpts = {
-  method?: "GET" | "POST" | "PUT" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
   body?: unknown;
   signal?: AbortSignal;
   /** When true (default for trade endpoints), an Idempotency-Key header is auto-attached. */

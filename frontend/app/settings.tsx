@@ -28,19 +28,31 @@ type Quota = {
   rolls_over_at: string;
 };
 
+type BrokersStatus = {
+  live_ingest: boolean;
+  venues: Record<"polymarket" | "kalshi", { configured: boolean }>;
+  current_user: { live_mode: boolean; live_broker: string | null };
+};
+
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
   const router = useRouter();
   const snack = useSnackbar();
   const [busy, setBusy] = useState(false);
   const [quota, setQuota] = useState<Quota | null>(null);
+  const [brokers, setBrokers] = useState<BrokersStatus | null>(null);
 
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
       try {
-        const q = await api<Quota>("/me/quota");
-        if (!cancelled) setQuota(q);
+        const [q, b] = await Promise.all([
+          api<Quota>("/me/quota"),
+          api<BrokersStatus>("/brokers/status"),
+        ]);
+        if (cancelled) return;
+        setQuota(q);
+        setBrokers(b);
       } catch {
         /* silent — non-critical */
       }
@@ -52,6 +64,26 @@ export default function SettingsScreen() {
       clearInterval(id);
     };
   }, []);
+
+  async function pickBroker(name: "polymarket" | "kalshi" | null) {
+    try {
+      setBusy(true);
+      await api("/me/live-broker", { method: "PATCH", body: { broker: name } });
+      const b = await api<BrokersStatus>("/brokers/status");
+      setBrokers(b);
+      snack.show({
+        message: name ? `Live broker set to ${name}` : "Live broker cleared",
+        kind: "success",
+      });
+    } catch (e: any) {
+      snack.show({
+        message: e?.message || "Could not switch broker",
+        kind: "error",
+      });
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function setFlag(key: "biometrics_enabled" | "live_mode", value: boolean) {
     setBusy(true);
@@ -148,26 +180,21 @@ export default function SettingsScreen() {
         <Card>
           <Text style={styles.metricLabel}>EXECUTION MODE</Text>
           <View style={styles.row}>
-            <View>
+            <View style={{ flex: 1, paddingRight: space.sm }}>
               <Text style={styles.rowLabel}>Live Trading</Text>
               <Text style={styles.subtle}>
-                Live venues require Polymarket / Kalshi API setup. Paper-only by default.
+                Live mode routes orders to your selected venue. Falls back to paper
+                if the chosen venue isn't configured server-side.
               </Text>
             </View>
             <Switch
               testID="settings-live-mode-switch"
               value={!!user?.live_mode}
               onValueChange={(v) => {
-                if (v) {
+                if (v && !brokers?.current_user.live_broker) {
                   snack.show({
-                    message: "Live mode unavailable in paper-only build.",
+                    message: "Pick a live broker first.",
                     kind: "warning",
-                    action: { label: "Why", onPress: () =>
-                      Alert.alert(
-                        "Live mode",
-                        "Live execution requires venue API keys (Polymarket/Kalshi). Paper mode remains active."
-                      )
-                    },
                   });
                   return;
                 }
@@ -178,6 +205,72 @@ export default function SettingsScreen() {
               thumbColor={user?.live_mode ? colors.negative : colors.textTertiary}
             />
           </View>
+        </Card>
+
+        <Card>
+          <Text style={styles.metricLabel}>LIVE BROKER</Text>
+          <Text style={[styles.subtle, { marginBottom: space.sm }]}>
+            Pick a venue. Selection is rejected if the server isn't configured for it.
+          </Text>
+          {(["polymarket", "kalshi"] as const).map((name) => {
+            const ready = !!brokers?.venues?.[name]?.configured;
+            const active = brokers?.current_user.live_broker === name;
+            return (
+              <Pressable
+                key={name}
+                accessibilityRole="button"
+                accessibilityState={{ selected: active, disabled: !ready }}
+                onPress={() => ready && !busy && pickBroker(active ? null : name)}
+                style={({ pressed }) => [
+                  styles.brokerRow,
+                  {
+                    borderColor: active ? colors.primary : colors.borderSubtle,
+                    opacity: !ready ? 0.55 : pressed ? 0.75 : 1,
+                  },
+                ]}
+              >
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.brokerName}>
+                    {name === "polymarket" ? "Polymarket" : "Kalshi"}
+                  </Text>
+                  <Text style={styles.brokerHint}>
+                    {ready ? "Server credentials configured" : "Not configured on server"}
+                  </Text>
+                </View>
+                <View
+                  style={[
+                    styles.statusDot,
+                    { backgroundColor: ready ? colors.positive : colors.textTertiary },
+                  ]}
+                />
+                {active && (
+                  <Feather
+                    name="check-circle"
+                    size={18}
+                    color={colors.primary}
+                    style={{ marginLeft: 10 }}
+                  />
+                )}
+              </Pressable>
+            );
+          })}
+          {brokers?.current_user.live_broker && (
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel="Clear live broker selection"
+              onPress={() => pickBroker(null)}
+              style={{ marginTop: space.sm }}
+            >
+              <Text style={{ color: colors.textSecondary, fontSize: 12 }}>
+                Clear selection →
+              </Text>
+            </Pressable>
+          )}
+          {brokers?.live_ingest === false && (
+            <Text style={[styles.subtle, { marginTop: space.sm, color: colors.alpha }]}>
+              ⚠ Live market data ingest is OFF. Set LIVE_INGEST_ENABLED=true in backend .env.
+            </Text>
+          )}
         </Card>
 
         <Card>
@@ -237,4 +330,16 @@ const styles = StyleSheet.create({
   },
   rowLabel: { color: colors.textPrimary, fontSize: 14 },
   rowValue: { color: colors.textPrimary, fontWeight: "600" },
+  brokerRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 12,
+    paddingHorizontal: 12,
+    borderRadius: 10,
+    borderWidth: 1,
+    marginBottom: 8,
+  },
+  brokerName: { ...(typo.body as any), color: colors.textPrimary, fontWeight: "600" },
+  brokerHint: { ...(typo.caption as any), color: colors.textSecondary, marginTop: 2 },
+  statusDot: { width: 8, height: 8, borderRadius: 4 },
 });
