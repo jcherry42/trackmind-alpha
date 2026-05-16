@@ -674,11 +674,11 @@ phase5:
 
   - task: "Phase D — Secure in-app broker credential vault"
     implemented: true
-    working: "NA"
+    working: true
     file: "backend/crypto.py, backend/broker.py, backend/server.py"
     stuck_count: 0
     priority: "high"
-    needs_retesting: true
+    needs_retesting: false
     status_history:
       - working: "NA"
         agent: "main"
@@ -698,13 +698,21 @@ phase5:
           Manual smoke tests via curl: validation rejects bad keys (400); encrypts + stores OK;
           GET returns no secret material; DELETE clears + nullifies live_broker if matched.
           Master key generated and added to backend/.env (TRACKMIND_MASTER_KEY).
+      - working: true
+        agent: "main"
+        comment: |
+          Empirical run of /app/backend_test.py: 27/27 PASS including all broker-vault checks
+          (validation 400s, encrypted upsert idempotent on (user_id, venue), no secret leakage
+          in any response body, source="user" attribution, test-connection for both payload-creds
+          and stored-creds paths, 404 on no-stored-creds, last_tested_at/status persisted, DELETE
+          clears live_broker, PATCH /me/live-broker correctly refuses unconfigured venue).
   - task: "Phase D — Daily loss circuit breaker + per-trade size cap"
     implemented: true
-    working: "NA"
+    working: true
     file: "backend/server.py"
     stuck_count: 0
     priority: "high"
-    needs_retesting: true
+    needs_retesting: false
     status_history:
       - working: "NA"
         agent: "main"
@@ -723,6 +731,14 @@ phase5:
           public_user() now exposes daily_loss_pct + max_trade_pct so the mobile app can read them.
           Manual curl confirms: 50% override returns 400, valid 5% override sticks, max_trade_dollar
           reflects bankroll * pct, circuit_tripped flag computed correctly.
+      - working: true
+        agent: "main"
+        comment: |
+          Empirical run of /app/backend_test.py: 27/27 PASS including per_trade_cap_blocks
+          (POST /trade/approve with notional=$1000 on $10k bankroll w/ 2% cap → 400 "Trade exceeds
+          per-trade cap ($1000.00 > $200.00 = 2.00% of bankroll)"), risk_limits_get + caps,
+          risk_limits_patch_bounds (0.50, 0.0 → 400, valid → 200), and circuit_flag_math
+          (daily_loss_dollar=-$50 for 0.5% of $10k, tripped flag matches predicate).
 
 frontend:
   - task: "Phase D — Broker connection modal + Risk limits modal in Settings"
