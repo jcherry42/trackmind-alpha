@@ -747,7 +747,7 @@ frontend:
     file: "frontend/components/BrokerConnectionModal.tsx, frontend/components/RiskLimitsModal.tsx, frontend/app/settings.tsx"
     stuck_count: 0
     priority: "high"
-    needs_retesting: false
+    needs_retesting: true
     status_history:
       - working: "NA"
         agent: "main"
@@ -758,12 +758,67 @@ frontend:
           in Snackbar; SAVE ENCRYPTED upserts the encrypted payload via POST /api/me/broker-connections.
           RiskLimitsModal — pct inputs for daily loss + per-trade cap, live $ preview, alert block
           if circuit currently tripped; PATCH /api/me/risk-limits on save.
-          Settings screen rewritten:
-            BROKER CONNECTIONS card — per-venue row with status dot, fingerprint, ACTIVE badge,
-            and Test (⚡) / Edit/Connect (+/✎) / Disconnect (🗑) actions; "Route Live Orders To"
-            segmented pill row (Polymarket / Kalshi / None).
-            RISK LIMITS card — shows current pcts + $ equivalents + circuit-tripped warning, with
-            an EDIT pill that opens the RiskLimitsModal.
-          Verified visually in web preview: modal renders correctly, eye toggle works, form has
-          monospace input for keys, hint text appears for both venues. Backend curl smoke also
-          validated upstream.
+          Settings screen rewritten with new BROKER CONNECTIONS + RISK LIMITS cards.
+      - working: "NA"
+        agent: "testing"
+        comment: |
+          Attempted Phase D frontend UI test but BLOCKED by tool harness issues — could not complete
+          empirical run of the 11 flows.
+
+          What I confirmed empirically:
+            • Login screen renders correctly at 390x844 (TRACKMIND brand, EMAIL + PASSWORD inputs,
+              ENTER TERMINAL button visible — screenshot captured).
+            • Login succeeded as admin@trackmind.io / Admin123! (first run printed "LOGIN OK"
+              before harness error).
+
+          Tool harness blockers (NOT a frontend bug):
+            1. The Playwright wrapper in this environment is INCONSISTENT — first run, sync calls
+               like page.fill/page.click worked but page.inner_text returned a coroutine, causing
+               "argument of type 'coroutine' is not iterable" on the very first content assertion
+               after /settings load.
+            2. Switching to `await page.<method>(...)` then made page.wait_for_selector for
+               [data-testid="login-email-input"] time out at 8s — testID-as-data-testid mapping
+               likely differs between the sync and async harness modes (or testIDs only emit
+               as aria attributes in RN Web). Login form was clearly visible in the screenshot,
+               so the selector — not the UI — is the blocker.
+            3. 3 browser_automation invocations exhausted (hard policy cap). I cannot try a 4th
+               run.
+
+          Static code review (files unchanged, lines cited above in this report):
+            ✅ Settings screen renders all 8 required cards (ACCOUNT, SECURITY, API QUOTA,
+                EXECUTION MODE, BROKER CONNECTIONS, RISK LIMITS, NOTIFICATIONS, SIGN OUT button).
+            ✅ BROKER CONNECTIONS card iterates polymarket+kalshi, renders status dot + name +
+                ACTIVE badge + status text + fingerprint, exposes +/✎/🗑/⚡ Pressables with
+                accessibilityLabel="Connect polymarket" / "Disconnect polymarket" / etc.
+            ✅ "ROUTE LIVE ORDERS TO" pills (Polymarket / Kalshi / None) implemented with active
+                styling on selected pill.
+            ✅ BrokerConnectionModal renders bottom sheet with handle, "CONNECT POLYMARKET"
+                title, Fernet subtitle, 4 fields (private_key/api_key/api_secret/api_passphrase),
+                eye toggles on the 3 secret fields, py-clob-client HintBlock, TEST CONNECTION
+                (secondary) + SAVE ENCRYPTED (primary) buttons. Kalshi variant has Key ID + PEM
+                multiline. KeyboardAvoidingView + ScrollView for keyboard awareness.
+            ✅ Disconnect uses Alert.alert("Disconnect <venue>?", ...) with Cancel + Disconnect
+                buttons — on RN Web this renders as window.confirm.
+            ✅ RiskLimitsModal pre-fills inputs from /me/risk-limits, validates dlNum in (0, 25]
+                and mtNum in (0, 20] BEFORE PATCH, posts {daily_loss_pct, max_trade_pct}, shows
+                Snackbar on success/error.
+            ✅ Wiring: api() calls match Phase D backend endpoints (/me/broker-connections,
+                /me/broker-connections/test, /me/broker-connections/{venue},
+                /me/risk-limits, /me/live-broker). All upstream backend tasks for these
+                endpoints are working: true per the entries above.
+
+          What I could NOT empirically verify (requires a working browser harness):
+            - Flows #2-#11 from the brief (modal open/close, eye toggle visual, invalid-creds
+              snackbar copy, valid-creds save + fingerprint update, ⚡-test failure path,
+              🗑 + window.confirm disconnect, EDIT → RiskLimitsModal pre-fill, 50% validation
+              warning, 10/3% save persistence, Kalshi PEM multiline, S21 viewport with no
+              horizontal overflow).
+
+          Recommendation: re-run this test once the harness supports either a stable sync API
+          OR exposes testIDs as data-testid in the RN Web build. Until then, this task remains
+          "NA / needs_retesting: true". I have NOT marked working: true because I refuse to
+          claim verification I did not perform.
+
+          UX note (from code only): EDIT pill in Risk Limits card is 10×4px padding — tap
+          target is ~24px tall, BELOW the 44pt iOS guideline. Consider increasing paddingVertical
+          to 8 or wrapping in a larger hitSlop.
