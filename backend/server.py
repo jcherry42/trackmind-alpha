@@ -50,6 +50,7 @@ from broker import (
     KALSHI_REQUIRED,
 )
 from crypto import encrypt_payload, fingerprint_for
+from push import push_to_user as _push_to_user_async, DEFAULT_NOTIFY_PREFS
 from live_market import LIVE_INGEST_ENABLED, ingest_forever
 from observability import (
     configure_json_logging,
@@ -280,6 +281,7 @@ def public_user(u: dict) -> dict:
         "kill_switch": u.get("kill_switch", False),
         "daily_loss_pct": float(u.get("daily_loss_pct", DEFAULT_DAILY_LOSS_PCT)),
         "max_trade_pct": float(u.get("max_trade_pct", DEFAULT_MAX_TRADE_PCT)),
+        "notification_prefs": {**DEFAULT_NOTIFY_PREFS, **(u.get("notification_prefs") or {})},
         "created_at": u.get("created_at", datetime.now(timezone.utc)).isoformat(),
     }
 
@@ -294,12 +296,20 @@ def _risk_limits_for(user: dict) -> tuple[float, float]:
 
 
 def _check_daily_loss_circuit(user: dict) -> None:
-    """Raise 400 if today's realized PnL has breached the daily loss circuit."""
+    """Raise 400 if today's realized PnL has breached the daily loss circuit.
+
+    Also fires a one-time-per-UTC-day push notification to the user when the
+    circuit first trips.
+    """
     dl_pct, _ = _risk_limits_for(user)
     starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
     realized_today = float(user.get("realized_pnl_today", 0.0))
     threshold = -starting * dl_pct
     if realized_today <= threshold:
+        # Fire B3 push at most once per UTC day per user.
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if user.get("circuit_tripped_alert_date") != today_key:
+            asyncio.create_task(_fire_circuit_tripped(user, today_key, realized_today, threshold))
         raise HTTPException(
             status_code=400,
             detail=(
@@ -308,6 +318,33 @@ def _check_daily_loss_circuit(user: dict) -> None:
                 f"Trading paused until UTC midnight."
             ),
         )
+
+
+async def _fire_circuit_tripped(user: dict, today_key: str, realized: float, threshold: float) -> None:
+    """B3: notify the user once-per-day that their daily loss circuit tripped."""
+    try:
+        # Stamp the user doc atomically so concurrent callers don't double-fire.
+        res = await db.users.update_one(
+            {"_id": user["_id"], "$or": [
+                {"circuit_tripped_alert_date": {"$exists": False}},
+                {"circuit_tripped_alert_date": {"$ne": today_key}},
+            ]},
+            {"$set": {"circuit_tripped_alert_date": today_key}},
+        )
+        if res.modified_count != 1:
+            return  # someone else already fired today
+        fresh = await db.users.find_one({"_id": user["_id"]})
+        if not fresh:
+            return
+        await _push_to_user_async(
+            db, fresh,
+            category="daily_loss_tripped",
+            title="🛑 Daily Loss Circuit Tripped",
+            body=f"Lost ${abs(realized):.2f} today (limit ${abs(threshold):.2f}). Trading paused until UTC midnight.",
+            data={"type": "daily_loss_tripped", "realized": realized, "threshold": threshold},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"push.daily_loss_tripped failed: {e}")
 
 
 def _clamp_notional_to_cap(user: dict, notional: float) -> float:
@@ -488,6 +525,7 @@ async def settle_open_positions(user: dict) -> float:
     """
     user_id = str(user["_id"])
     lock = _user_locks[user_id]
+    settled_events: List[dict] = []
     async with lock:
         realized_delta = 0.0
         cursor = db.positions.find({"user_id": user_id, "status": "open"})
@@ -527,13 +565,45 @@ async def settle_open_positions(user: dict) -> float:
                 if settle_res.modified_count == 1:
                     realized_delta += realized
                     await audit(user_id, "position.settled", {"position_id": str(pos["_id"]), "won": won, "pnl": realized})
+                    settled_events.append({
+                        "won": won,
+                        "pnl": realized,
+                        "market": pos.get("market", "—"),
+                        "engine": pos.get("engine", "—"),
+                        "position_id": str(pos["_id"]),
+                    })
 
         if realized_delta != 0:
             await db.users.update_one(
                 {"_id": user["_id"]},
                 {"$inc": {"bankroll": realized_delta, "realized_pnl_today": realized_delta}},
             )
-        return realized_delta
+
+    # Fire B1 push notifications AFTER releasing the per-user lock to avoid extending
+    # the critical section by an outbound HTTP call. Best-effort: never raises.
+    if settled_events:
+        fresh = await db.users.find_one({"_id": user["_id"]})
+        if fresh:
+            asyncio.create_task(_fire_settled_pushes(fresh, settled_events))
+    return realized_delta
+
+
+async def _fire_settled_pushes(user: dict, events: List[dict]) -> None:
+    """Send up to 5 position-settled pushes per tick (avoid notification fatigue)."""
+    try:
+        for ev in events[:5]:
+            won = ev["won"]
+            sign = "+" if ev["pnl"] >= 0 else ""
+            title = f"{'✓ WON' if won else '✗ LOST'} · {ev['engine'].upper()}"
+            body = f"{ev['market'][:60]} · {sign}${ev['pnl']:.2f}"
+            await _push_to_user_async(
+                db, user,
+                category="position_settled",
+                title=title, body=body,
+                data={"type": "position_settled", "position_id": ev["position_id"], "pnl": ev["pnl"]},
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"push.position_settled failed: {e}")
 
 
 # ---------- auth routes ----------
@@ -1081,6 +1151,9 @@ async def auto_deploy(
             deployed.append(_serialize_position(pos_doc))
         await audit(user_id, "trade.auto_deploy", {"count": len(deployed)})
         response = {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
+        # B2 push: notify user when auto-deploy actually placed orders.
+        if deployed:
+            asyncio.create_task(_fire_auto_deploy_push(user, deployed))
         if ikey:
             await _finalize_idempotency(ikey, user_id, response)
         return response
@@ -1168,8 +1241,13 @@ async def update_controls(payload: ControlsIn, user: dict = Depends(get_current_
     if payload.paused_engines is not None:
         valid = {"alpha", "quant", "whale", "micro"}
         update["paused_engines"] = [e for e in payload.paused_engines if e in valid]
+    kill_switch_changed = False
+    new_kill_value = None
     if payload.kill_switch is not None:
-        update["kill_switch"] = bool(payload.kill_switch)
+        new_kill_value = bool(payload.kill_switch)
+        if new_kill_value != bool(user.get("kill_switch", False)):
+            kill_switch_changed = True
+        update["kill_switch"] = new_kill_value
     if payload.live_mode is not None:
         update["live_mode"] = bool(payload.live_mode)
     if payload.biometrics_enabled is not None:
@@ -1179,7 +1257,82 @@ async def update_controls(payload: ControlsIn, user: dict = Depends(get_current_
     await db.users.update_one({"_id": user["_id"]}, {"$set": update})
     await audit(str(user["_id"]), "controls.update", update)
     user = await db.users.find_one({"_id": user["_id"]})
+    # B4 push: kill-switch transition confirmation.
+    if kill_switch_changed:
+        asyncio.create_task(_fire_kill_switch_push(user, new_kill_value))
     return public_user(user)
+
+
+async def _fire_auto_deploy_push(user: dict, deployed: List[dict]) -> None:
+    """B2: notify user when one-tap auto-deploy fires."""
+    try:
+        # Refresh user (latest bankroll snapshot for nicer body).
+        fresh = await db.users.find_one({"_id": user["_id"]})
+        if not fresh:
+            return
+        n = len(deployed)
+        total = sum(float(d.get("notional", 0.0)) for d in deployed)
+        engines = ",".join(sorted({d.get("engine", "") for d in deployed if d.get("engine")}))
+        await _push_to_user_async(
+            db, fresh,
+            category="auto_deploy",
+            title=f"⚡ AUTO-DEPLOY · {n} trade{'s' if n != 1 else ''}",
+            body=f"${total:.2f} routed across {engines or '—'}.",
+            data={"type": "auto_deploy", "count": n, "total_notional": round(total, 2)},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"push.auto_deploy failed: {e}")
+
+
+async def _fire_kill_switch_push(user: dict, enabled: bool) -> None:
+    """B4: notify user that they toggled the global kill switch."""
+    try:
+        await _push_to_user_async(
+            db, user,
+            category="kill_switch",
+            title="🧨 KILL SWITCH " + ("ENABLED" if enabled else "DISABLED"),
+            body=(
+                "All engines halted. Open positions kept; new trades blocked."
+                if enabled
+                else "Trading resumed. Engines are live again."
+            ),
+            data={"type": "kill_switch", "enabled": enabled},
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"push.kill_switch failed: {e}")
+
+
+# ---------- notification preferences ----------
+class NotifyPrefsIn(BaseModel):
+    master_signal: Optional[bool] = None
+    position_settled: Optional[bool] = None
+    auto_deploy: Optional[bool] = None
+    daily_loss_tripped: Optional[bool] = None
+    kill_switch: Optional[bool] = None
+
+
+@api.get("/me/notification-prefs")
+async def get_notification_prefs(user: dict = Depends(get_current_user)):
+    stored = user.get("notification_prefs") or {}
+    return {"prefs": {**DEFAULT_NOTIFY_PREFS, **stored}, "defaults": DEFAULT_NOTIFY_PREFS}
+
+
+@api.patch("/me/notification-prefs")
+async def update_notification_prefs(
+    payload: NotifyPrefsIn,
+    user: dict = Depends(get_current_user),
+):
+    update_fields: Dict[str, Any] = {}
+    for key in DEFAULT_NOTIFY_PREFS.keys():
+        val = getattr(payload, key, None)
+        if val is not None:
+            update_fields[f"notification_prefs.{key}"] = bool(val)
+    if not update_fields:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    await db.users.update_one({"_id": user["_id"]}, {"$set": update_fields})
+    await audit(str(user["_id"]), "notify_prefs.update", update_fields)
+    user = await db.users.find_one({"_id": user["_id"]})
+    return await get_notification_prefs(user)
 
 
 @api.post("/controls/pause")
@@ -1691,31 +1844,23 @@ async def _maybe_send_master_signal_alert() -> None:
     _master_signal_state["last_id"] = top["id"]
     _master_signal_state["last_ts"] = now
 
-    # Collect all distinct push tokens.
-    tokens: List[str] = []
-    async for u in db.users.find({"push_tokens.0": {"$exists": True}}):
-        for t in u.get("push_tokens", []) or []:
-            if isinstance(t, dict) and t.get("token"):
-                tokens.append(t["token"])
-    if not tokens:
-        return
-
     title = f"MASTER SIGNAL · {top['engine'].upper()} {top['side']}"
     body = f"{top['market'][:80]} · conf {int(top['confidence']*100)}% · edge +{top['expected_edge']*100:.1f}%"
+    data = {"signal_id": top["id"], "engine": top["engine"], "kind": "master_signal", "type": "master_signal"}
+    delivered = 0
+    skipped = 0
     try:
-        from push import send_to_tokens
-        result = await send_to_tokens(
-            tokens,
-            title,
-            body,
-            data={"signal_id": top["id"], "engine": top["engine"], "kind": "master_signal"},
-        )
-        # Prune any tokens Expo flagged as no-longer-registered.
-        for bad in result.get("invalid_tokens", []):
-            await db.users.update_many({}, {"$pull": {"push_tokens": {"token": bad}}})
+        async for u in db.users.find({"push_tokens.0": {"$exists": True}}):
+            # push_to_user already filters by `notification_prefs.master_signal`
+            # (default ON) and auto-prunes dead tokens.
+            r = await _push_to_user_async(db, u, category="master_signal", title=title, body=body, data=data)
+            if r.get("skipped"):
+                skipped += 1
+            else:
+                delivered += int(r.get("ok") or 0)
         logger.info(
             "master_signal_alert_sent",
-            extra={"signal_id": top["id"], "engine": top["engine"], "delivered": result["ok"]},
+            extra={"signal_id": top["id"], "engine": top["engine"], "delivered": delivered, "opted_out": skipped},
         )
     except Exception as e:  # noqa: BLE001
         logger.warning(f"master signal alert error: {e}")

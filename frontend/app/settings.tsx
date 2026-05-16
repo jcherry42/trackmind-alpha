@@ -44,6 +44,22 @@ type BrokerConnection = {
   last_test_result: string | null;
 };
 
+type NotifyPrefs = {
+  master_signal: boolean;
+  position_settled: boolean;
+  auto_deploy: boolean;
+  daily_loss_tripped: boolean;
+  kill_switch: boolean;
+};
+
+const NOTIFY_ROWS: Array<{ key: keyof NotifyPrefs; label: string; hint: string; icon: any }> = [
+  { key: "master_signal", label: "Master Signal", hint: "High-conviction multi-engine alert", icon: "zap" },
+  { key: "position_settled", label: "Position Settled", hint: "Win/loss + realized PnL", icon: "check-circle" },
+  { key: "auto_deploy", label: "Auto-Deploy", hint: "When one-tap deploy places orders", icon: "play-circle" },
+  { key: "daily_loss_tripped", label: "Daily Loss Circuit", hint: "Once-per-day when trading auto-pauses", icon: "alert-octagon" },
+  { key: "kill_switch", label: "Kill Switch", hint: "Confirmation when you toggle global halt", icon: "power" },
+];
+
 export default function SettingsScreen() {
   const { user, logout, refreshUser } = useAuth();
   const router = useRouter();
@@ -53,21 +69,24 @@ export default function SettingsScreen() {
   const [brokers, setBrokers] = useState<BrokersStatus | null>(null);
   const [connections, setConnections] = useState<BrokerConnection[]>([]);
   const [risk, setRisk] = useState<RiskLimits | null>(null);
+  const [notify, setNotify] = useState<NotifyPrefs | null>(null);
   const [modalVenue, setModalVenue] = useState<"polymarket" | "kalshi" | null>(null);
   const [riskOpen, setRiskOpen] = useState(false);
 
   const reload = async () => {
     try {
-      const [q, b, c, r] = await Promise.all([
+      const [q, b, c, r, n] = await Promise.all([
         api<Quota>("/me/quota"),
         api<BrokersStatus>("/brokers/status"),
         api<{ connections: BrokerConnection[] }>("/me/broker-connections"),
         api<RiskLimits>("/me/risk-limits"),
+        api<{ prefs: NotifyPrefs }>("/me/notification-prefs"),
       ]);
       setQuota(q);
       setBrokers(b);
       setConnections(c.connections || []);
       setRisk(r);
+      setNotify(n.prefs);
     } catch {
       /* silent — non-critical */
     }
@@ -128,6 +147,22 @@ export default function SettingsScreen() {
       snack.show({ message: e?.message || "Test failed", kind: "error" });
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function toggleNotifyPref(key: keyof NotifyPrefs, next: boolean) {
+    // Optimistic update so the Switch animates immediately.
+    setNotify((prev) => (prev ? { ...prev, [key]: next } : prev));
+    try {
+      const r = await api<{ prefs: NotifyPrefs }>("/me/notification-prefs", {
+        method: "PATCH",
+        body: { [key]: next },
+      });
+      setNotify(r.prefs);
+    } catch (e: any) {
+      // Roll back optimistic update on failure.
+      setNotify((prev) => (prev ? { ...prev, [key]: !next } : prev));
+      snack.show({ message: e?.message || "Could not update notifications", kind: "error" });
     }
   }
 
@@ -455,10 +490,42 @@ export default function SettingsScreen() {
 
         <Card>
           <Text style={styles.metricLabel}>NOTIFICATIONS</Text>
-          <Text style={styles.subtle}>
-            Push alerts coming next: master signal alerts, position settlements,
-            kill-switch confirmations.
+          <Text style={[styles.subtle, { marginBottom: space.sm }]}>
+            Per-event push controls. Defaults are all on — toggle any category off to silence it.
           </Text>
+          {NOTIFY_ROWS.map((cfg, idx) => {
+            const isOn = notify ? notify[cfg.key] : true;
+            return (
+              <View
+                key={cfg.key}
+                style={[
+                  styles.notifyRow,
+                  idx === NOTIFY_ROWS.length - 1 && { borderBottomWidth: 0 },
+                ]}
+              >
+                <View style={styles.notifyIcon}>
+                  <Feather
+                    name={cfg.icon}
+                    size={16}
+                    color={isOn ? colors.textPrimary : colors.textTertiary}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.rowLabel, !isOn && { color: colors.textSecondary }]}>
+                    {cfg.label}
+                  </Text>
+                  <Text style={styles.subtle}>{cfg.hint}</Text>
+                </View>
+                <Switch
+                  value={isOn}
+                  onValueChange={(v) => toggleNotifyPref(cfg.key, v)}
+                  trackColor={{ false: colors.borderSubtle, true: colors.primary }}
+                  thumbColor="#fff"
+                  disabled={!notify}
+                />
+              </View>
+            );
+          })}
         </Card>
 
         <View style={{ marginTop: space.md }}>
@@ -585,5 +652,22 @@ const styles = StyleSheet.create({
     borderRadius: 8,
     backgroundColor: colors.negativeSoft,
     marginTop: space.sm,
+  },
+  notifyRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 10,
+    gap: 12,
+    borderBottomColor: colors.borderSubtle,
+    borderBottomWidth: 1,
+    minHeight: 56,
+  },
+  notifyIcon: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    backgroundColor: colors.modal,
+    alignItems: "center",
+    justifyContent: "center",
   },
 });
