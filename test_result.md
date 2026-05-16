@@ -351,8 +351,8 @@ metadata:
 
 test_plan:
   current_focus:
-    - "Phase D — Secure in-app broker credential vault"
-    - "Phase D — Daily loss circuit breaker + per-trade size cap"
+    - "Task B — Per-user push notification triggers + opt-out card"
+    - "Task C-light — Extract state + models from server.py"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -750,6 +750,57 @@ frontend:
     needs_retesting: true
     status_history:
       - working: "NA"
+  - task: "Task B — Per-user push notification triggers + opt-out card"
+    implemented: true
+    working: true
+    file: "backend/push.py, backend/server.py, frontend/app/settings.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Wired 4 per-user push categories with one-per-day dedupe where appropriate:
+            B1 position_settled  — fired after settle_open_positions releases its lock; up to 5 events/tick.
+            B2 auto_deploy       — fired at end of /trade/auto-deploy if any orders placed.
+            B3 daily_loss_tripped — fired from _check_daily_loss_circuit, deduped via an atomic
+                                    `circuit_tripped_alert_date` stamp on the user doc.
+            B4 kill_switch       — fired on update_controls when kill_switch transitions.
+          Existing master-signal fan-out refactored to use push_to_user(category="master_signal"),
+          so it now respects per-user opt-outs and auto-prunes invalid tokens.
+          New endpoints (curl-verified):
+            GET   /api/me/notification-prefs   — returns prefs + defaults (all true by default)
+            PATCH /api/me/notification-prefs   — partial update; empty body → 400
+          public_user() now exposes `notification_prefs` so the mobile app can read them.
+          Settings UI: replaced the placeholder Notifications card with a real card showing 5
+          toggles (icon + label + hint + Switch) — optimistic update + rollback on failure.
+          27/27 backend tests still pass after this change.
+  - task: "Task C-light — Extract state + models from server.py"
+    implemented: true
+    working: true
+    file: "backend/state.py, backend/models.py, backend/server.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Refactor (zero functional change):
+            backend/state.py  (NEW, 102 lines) — RateLimit class + named limiter instances
+                              (rl_login, rl_register, rl_refresh, rl_trade, rl_auto_deploy),
+                              user_locks, engine_cache + lock, alpha_cache + lock, llm_metrics,
+                              master_signal_state.
+            backend/models.py (NEW, 80 lines)  — all Pydantic request models:
+                              RegisterIn, LoginIn, TokenPair, TradeApproveIn, ControlsIn,
+                              LiveBrokerIn, BrokerConnIn, RiskLimitsIn, NotifyPrefsIn, PushTokenIn.
+            backend/server.py — imports the above; all in-line definitions removed.
+                              File slimmed 2002 → 1923 lines. All route handlers untouched
+                              (state imports aliased to existing names like `_rl_login`,
+                              `_engine_cache` so route code is byte-identical).
+          27/27 backend tests still pass.  Lint clean.  C-full router-per-domain split deferred.
+
         agent: "main"
         comment: |
           BrokerConnectionModal — bottom sheet w/ Polymarket (private_key, api_key, api_secret,

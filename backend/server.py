@@ -52,6 +52,33 @@ from broker import (
 from crypto import encrypt_payload, fingerprint_for
 from push import push_to_user as _push_to_user_async, DEFAULT_NOTIFY_PREFS
 from live_market import LIVE_INGEST_ENABLED, ingest_forever
+from state import (
+    RateLimit,
+    rl_login as _rl_login,
+    rl_register as _rl_register,
+    rl_refresh as _rl_refresh,
+    rl_trade as _rl_trade,
+    rl_auto_deploy as _rl_auto_deploy,
+    user_locks as _user_locks,
+    engine_cache as _engine_cache,
+    engine_cache_lock as _engine_cache_lock,
+    alpha_cache as _alpha_cache,
+    alpha_cache_lock as _alpha_cache_lock,
+    llm_metrics as _llm_metrics,
+    master_signal_state as _master_signal_state,
+)
+from models import (
+    RegisterIn,
+    LoginIn,
+    TokenPair,
+    TradeApproveIn,
+    ControlsIn,
+    LiveBrokerIn,
+    BrokerConnIn,
+    RiskLimitsIn,
+    NotifyPrefsIn,
+    PushTokenIn,
+)
 from observability import (
     configure_json_logging,
     request_id_var,
@@ -160,51 +187,6 @@ if not _JWT_SECRET or _JWT_SECRET in {"change_me_in_prod", "change_me", "dev", "
     _JWT_SECRET = uuid.uuid4().hex + uuid.uuid4().hex
     logger.warning("JWT_SECRET missing/weak — generated ephemeral secret. Set JWT_SECRET in prod.")
 os.environ["JWT_SECRET"] = _JWT_SECRET
-
-# Rate limiter: lightweight sliding-window per (key, bucket). Dependency-injected.
-class RateLimit:
-    """Sliding-window rate limiter per-IP for a named bucket. Call :meth:`check` manually."""
-
-    _windows: Dict[str, List[float]] = defaultdict(list)
-
-    def __init__(self, bucket: str, max_calls: int, per_seconds: float):
-        self.bucket = bucket
-        self.max = max_calls
-        self.window = per_seconds
-
-    def check(self, request: Request) -> None:
-        # Prefer the left-most entry in X-Forwarded-For (originating client) when behind a proxy
-        # so the limiter windows correctly even across multiple ingress pods.
-        xff = request.headers.get("x-forwarded-for") or request.headers.get("X-Forwarded-For") or ""
-        ip = xff.split(",")[0].strip() if xff else (request.client.host if request.client else "unknown")
-        key = f"{self.bucket}:{ip}"
-        now = time.time()
-        hist = RateLimit._windows[key]
-        cutoff = now - self.window
-        while hist and hist[0] < cutoff:
-            hist.pop(0)
-        if len(hist) >= self.max:
-            retry = int(hist[0] + self.window - now) + 1
-            raise HTTPException(
-                status_code=429,
-                detail=f"Rate limit exceeded: {self.max} per {int(self.window)}s. Retry in {retry}s.",
-            )
-        hist.append(now)
-
-# Named limiters.
-_rl_login = RateLimit("login", 60, 60)
-_rl_register = RateLimit("register", 5, 3600)
-_rl_refresh = RateLimit("refresh", 60, 60)
-_rl_trade = RateLimit("trade", 60, 60)
-_rl_auto_deploy = RateLimit("auto_deploy", 30, 60)
-
-# Per-user async locks for settlement / balance mutation.
-_user_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
-
-# LLM narrative score cache: keyed by (canonical_id, bucket) with 3-min bucket.
-_alpha_cache: Dict[str, Dict[str, Any]] = {}
-_alpha_cache_lock = asyncio.Lock()
-_llm_metrics = {"calls": 0, "cache_hits": 0, "failures": 0, "total_ms": 0.0}
 
 
 # ---------- helpers ----------
@@ -397,44 +379,13 @@ async def audit(user_id: str, action: str, payload: dict | None = None) -> None:
     })
 
 
-# ---------- schemas ----------
-class RegisterIn(BaseModel):
-    email: EmailStr
-    password: str = Field(min_length=6, max_length=128)
-    name: str = Field(default="", max_length=80)
+# ---------- schemas (moved to models.py) ----------
+# RegisterIn / LoginIn / TokenPair / TradeApproveIn / ControlsIn /
+# LiveBrokerIn / BrokerConnIn / RiskLimitsIn / NotifyPrefsIn / PushTokenIn
+# are all imported from backend/models.py.
 
 
-class LoginIn(BaseModel):
-    email: EmailStr
-    password: str
-
-
-class TokenPair(BaseModel):
-    access_token: str
-    refresh_token: str
-    user: dict
-
-
-class TradeApproveIn(BaseModel):
-    signal_id: str
-    notional: Optional[float] = None  # override sizing
-
-
-class ControlsIn(BaseModel):
-    paused_engines: Optional[List[str]] = None
-    kill_switch: Optional[bool] = None
-    live_mode: Optional[bool] = None
-    biometrics_enabled: Optional[bool] = None
-
-
-# ---------- engine cache ----------
-_engine_cache: Dict[str, Any] = {
-    "signals": [],         # list of all signals across engines
-    "by_id": {},            # signal_id -> signal
-    "by_engine": {"alpha": [], "quant": [], "whale": [], "micro": []},
-    "updated_at": 0.0,
-}
-_engine_cache_lock = asyncio.Lock()
+# ---------- engine cache (state lives in state.py) ----------
 
 
 async def refresh_engines() -> None:
@@ -1303,14 +1254,6 @@ async def _fire_kill_switch_push(user: dict, enabled: bool) -> None:
 
 
 # ---------- notification preferences ----------
-class NotifyPrefsIn(BaseModel):
-    master_signal: Optional[bool] = None
-    position_settled: Optional[bool] = None
-    auto_deploy: Optional[bool] = None
-    daily_loss_tripped: Optional[bool] = None
-    kill_switch: Optional[bool] = None
-
-
 @api.get("/me/notification-prefs")
 async def get_notification_prefs(user: dict = Depends(get_current_user)):
     stored = user.get("notification_prefs") or {}
@@ -1535,8 +1478,10 @@ async def brokers_status(user: dict = Depends(get_current_user)):
     }
 
 
-class LiveBrokerIn(BaseModel):
-    broker: Optional[str] = None  # "polymarket" | "kalshi" | null to clear
+class LiveBrokerIn(BaseModel):  # noqa: F811
+    """Re-imported from models.py — kept as a local rebind for now."""
+
+    broker: Optional[str] = None
 
 
 @api.patch("/me/live-broker")
@@ -1564,18 +1509,6 @@ async def set_live_broker(payload: LiveBrokerIn, user: dict = Depends(get_curren
 
 
 # ---------- broker connections (in-app secure credential vault) ----------
-class BrokerConnIn(BaseModel):
-    venue: str  # "polymarket" | "kalshi"
-    # Polymarket fields
-    private_key: Optional[str] = None
-    api_key: Optional[str] = None
-    api_secret: Optional[str] = None
-    api_passphrase: Optional[str] = None
-    # Kalshi fields
-    key_id: Optional[str] = None
-    private_key_pem: Optional[str] = None
-
-
 def _validate_broker_creds(venue: str, raw: dict) -> dict:
     """Return a clean creds dict for `venue`, raising 400 on missing required fields."""
     if venue == "polymarket":
@@ -1716,11 +1649,6 @@ async def delete_broker_connection(venue: str, user: dict = Depends(get_current_
 
 
 # ---------- risk limits ----------
-class RiskLimitsIn(BaseModel):
-    daily_loss_pct: Optional[float] = None  # e.g. 0.05 = 5% of starting bankroll
-    max_trade_pct: Optional[float] = None   # e.g. 0.02 = 2% of bankroll per trade
-
-
 @api.get("/me/risk-limits")
 async def get_risk_limits(user: dict = Depends(get_current_user)):
     dl, mt = _risk_limits_for(user)
@@ -1777,11 +1705,6 @@ async def update_risk_limits(payload: RiskLimitsIn, user: dict = Depends(get_cur
 
 
 # ---------- push notifications ----------
-class PushTokenIn(BaseModel):
-    token: str
-    platform: Optional[str] = None  # "ios" | "android" | "web"
-
-
 @api.post("/me/push-token")
 async def register_push_token(payload: PushTokenIn, user: dict = Depends(get_current_user)):
     """Idempotently store the device's Expo push token under the user's profile."""
@@ -1813,8 +1736,7 @@ async def remove_push_token(payload: PushTokenIn, user: dict = Depends(get_curre
     return {"ok": True}
 
 
-# Serial state for the "master signal" alert deduper.
-_master_signal_state: Dict[str, Any] = {"last_id": None, "last_ts": 0.0}
+# Master signal deduper state is imported from state.py as _master_signal_state.
 MASTER_SIGNAL_THRESHOLD = float(os.environ.get("MASTER_SIGNAL_THRESHOLD", "0.65"))  # confidence × edge_norm
 MASTER_SIGNAL_COOLDOWN_SEC = int(os.environ.get("MASTER_SIGNAL_COOLDOWN_SEC", "1200"))  # 20 min
 
