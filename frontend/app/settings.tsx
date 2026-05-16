@@ -17,6 +17,8 @@ import { Button } from "../components/Button";
 import { Card } from "../components/Card";
 import { ProgressBar } from "../components/ProgressBar";
 import { useSnackbar } from "../components/Snackbar";
+import { BrokerConnectionModal } from "../components/BrokerConnectionModal";
+import { RiskLimitsModal, type RiskLimits } from "../components/RiskLimitsModal";
 import { colors, radius, space, type as typo } from "../lib/theme";
 import { formatUsd } from "../lib/format";
 
@@ -30,8 +32,16 @@ type Quota = {
 
 type BrokersStatus = {
   live_ingest: boolean;
-  venues: Record<"polymarket" | "kalshi", { configured: boolean }>;
+  venues: Record<"polymarket" | "kalshi", { configured: boolean; source: "user" | "env" | null }>;
   current_user: { live_mode: boolean; live_broker: string | null };
+};
+
+type BrokerConnection = {
+  venue: "polymarket" | "kalshi";
+  fingerprint: string;
+  status: "active" | "untested" | "failed";
+  last_tested_at: string | null;
+  last_test_result: string | null;
 };
 
 export default function SettingsScreen() {
@@ -41,36 +51,39 @@ export default function SettingsScreen() {
   const [busy, setBusy] = useState(false);
   const [quota, setQuota] = useState<Quota | null>(null);
   const [brokers, setBrokers] = useState<BrokersStatus | null>(null);
+  const [connections, setConnections] = useState<BrokerConnection[]>([]);
+  const [risk, setRisk] = useState<RiskLimits | null>(null);
+  const [modalVenue, setModalVenue] = useState<"polymarket" | "kalshi" | null>(null);
+  const [riskOpen, setRiskOpen] = useState(false);
+
+  const reload = async () => {
+    try {
+      const [q, b, c, r] = await Promise.all([
+        api<Quota>("/me/quota"),
+        api<BrokersStatus>("/brokers/status"),
+        api<{ connections: BrokerConnection[] }>("/me/broker-connections"),
+        api<RiskLimits>("/me/risk-limits"),
+      ]);
+      setQuota(q);
+      setBrokers(b);
+      setConnections(c.connections || []);
+      setRisk(r);
+    } catch {
+      /* silent — non-critical */
+    }
+  };
 
   useEffect(() => {
-    let cancelled = false;
-    const load = async () => {
-      try {
-        const [q, b] = await Promise.all([
-          api<Quota>("/me/quota"),
-          api<BrokersStatus>("/brokers/status"),
-        ]);
-        if (cancelled) return;
-        setQuota(q);
-        setBrokers(b);
-      } catch {
-        /* silent — non-critical */
-      }
-    };
-    load();
-    const id = setInterval(load, 30_000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
+    reload();
+    const id = setInterval(reload, 30_000);
+    return () => clearInterval(id);
   }, []);
 
   async function pickBroker(name: "polymarket" | "kalshi" | null) {
     try {
       setBusy(true);
       await api("/me/live-broker", { method: "PATCH", body: { broker: name } });
-      const b = await api<BrokersStatus>("/brokers/status");
-      setBrokers(b);
+      await reload();
       snack.show({
         message: name ? `Live broker set to ${name}` : "Live broker cleared",
         kind: "success",
@@ -80,6 +93,39 @@ export default function SettingsScreen() {
         message: e?.message || "Could not switch broker",
         kind: "error",
       });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnectBroker(name: "polymarket" | "kalshi") {
+    try {
+      setBusy(true);
+      await api(`/me/broker-connections/${name}`, { method: "DELETE" });
+      await reload();
+      await refreshUser();
+      snack.show({ message: `${name} disconnected`, kind: "success" });
+    } catch (e: any) {
+      snack.show({ message: e?.message || "Disconnect failed", kind: "error" });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function testSavedBroker(name: "polymarket" | "kalshi") {
+    try {
+      setBusy(true);
+      const r = await api<{ ok: boolean; detail: string }>(
+        "/me/broker-connections/test",
+        { method: "POST", body: { venue: name } },
+      );
+      snack.show({
+        message: r.ok ? `✓ ${name} authenticated` : `✗ ${r.detail}`,
+        kind: r.ok ? "success" : "error",
+      });
+      await reload();
+    } catch (e: any) {
+      snack.show({ message: e?.message || "Test failed", kind: "error" });
     } finally {
       setBusy(false);
     }
@@ -208,68 +254,202 @@ export default function SettingsScreen() {
         </Card>
 
         <Card>
-          <Text style={styles.metricLabel}>LIVE BROKER</Text>
+          <Text style={styles.metricLabel}>BROKER CONNECTIONS</Text>
           <Text style={[styles.subtle, { marginBottom: space.sm }]}>
-            Pick a venue. Selection is rejected if the server isn't configured for it.
+            Credentials are encrypted at-rest with Fernet (AES-128 + HMAC) using your master
+            key. Tested before any live order is routed.
           </Text>
           {(["polymarket", "kalshi"] as const).map((name) => {
-            const ready = !!brokers?.venues?.[name]?.configured;
+            const venue = brokers?.venues?.[name];
+            const conn = connections.find((c) => c.venue === name);
+            const ready = !!venue?.configured;
             const active = brokers?.current_user.live_broker === name;
+            const statusColor =
+              conn?.status === "active"
+                ? colors.positive
+                : conn?.status === "failed"
+                ? colors.negative
+                : ready
+                ? colors.alpha
+                : colors.textTertiary;
+            const statusText = conn
+              ? conn.status === "active"
+                ? "Authenticated"
+                : conn.status === "failed"
+                ? `Failed · ${conn.last_test_result?.slice(0, 36) || "unknown"}`
+                : "Untested"
+              : venue?.source === "env"
+              ? "Operator (env)"
+              : "Not connected";
             return (
-              <Pressable
-                key={name}
-                accessibilityRole="button"
-                accessibilityState={{ selected: active, disabled: !ready }}
-                onPress={() => ready && !busy && pickBroker(active ? null : name)}
-                style={({ pressed }) => [
-                  styles.brokerRow,
-                  {
-                    borderColor: active ? colors.primary : colors.borderSubtle,
-                    opacity: !ready ? 0.55 : pressed ? 0.75 : 1,
-                  },
-                ]}
-              >
+              <View key={name} style={styles.brokerRow}>
                 <View style={{ flex: 1 }}>
-                  <Text style={styles.brokerName}>
-                    {name === "polymarket" ? "Polymarket" : "Kalshi"}
-                  </Text>
+                  <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                    <View style={[styles.statusDot, { backgroundColor: statusColor }]} />
+                    <Text style={styles.brokerName}>
+                      {name === "polymarket" ? "Polymarket" : "Kalshi"}
+                    </Text>
+                    {active && (
+                      <View style={styles.activeBadge}>
+                        <Text style={styles.activeBadgeText}>ACTIVE</Text>
+                      </View>
+                    )}
+                  </View>
                   <Text style={styles.brokerHint}>
-                    {ready ? "Server credentials configured" : "Not configured on server"}
+                    {statusText}
+                    {conn?.fingerprint ? ` · ${conn.fingerprint}` : ""}
                   </Text>
                 </View>
-                <View
-                  style={[
-                    styles.statusDot,
-                    { backgroundColor: ready ? colors.positive : colors.textTertiary },
-                  ]}
-                />
-                {active && (
-                  <Feather
-                    name="check-circle"
-                    size={18}
-                    color={colors.primary}
-                    style={{ marginLeft: 10 }}
-                  />
-                )}
-              </Pressable>
+                <View style={{ flexDirection: "row", gap: 6 }}>
+                  {conn && (
+                    <Pressable
+                      accessibilityRole="button"
+                      onPress={() => testSavedBroker(name)}
+                      disabled={busy}
+                      style={({ pressed }) => [
+                        styles.smallBtn,
+                        { opacity: pressed ? 0.6 : 1 },
+                      ]}
+                    >
+                      <Feather name="zap" size={14} color={colors.textPrimary} />
+                    </Pressable>
+                  )}
+                  <Pressable
+                    accessibilityRole="button"
+                    accessibilityLabel={conn ? `Edit ${name}` : `Connect ${name}`}
+                    onPress={() => setModalVenue(name)}
+                    disabled={busy}
+                    style={({ pressed }) => [
+                      styles.smallBtn,
+                      { opacity: pressed ? 0.6 : 1 },
+                    ]}
+                  >
+                    <Feather
+                      name={conn ? "edit-2" : "plus"}
+                      size={14}
+                      color={colors.textPrimary}
+                    />
+                  </Pressable>
+                  {conn && (
+                    <Pressable
+                      accessibilityRole="button"
+                      accessibilityLabel={`Disconnect ${name}`}
+                      onPress={() =>
+                        Alert.alert(
+                          `Disconnect ${name}?`,
+                          "This will erase your encrypted credentials and clear live mode if active.",
+                          [
+                            { text: "Cancel", style: "cancel" },
+                            {
+                              text: "Disconnect",
+                              style: "destructive",
+                              onPress: () => disconnectBroker(name),
+                            },
+                          ],
+                        )
+                      }
+                      disabled={busy}
+                      style={({ pressed }) => [
+                        styles.smallBtn,
+                        { opacity: pressed ? 0.6 : 1, borderColor: colors.negativeSoft },
+                      ]}
+                    >
+                      <Feather name="trash-2" size={14} color={colors.negative} />
+                    </Pressable>
+                  )}
+                </View>
+              </View>
             );
           })}
-          {brokers?.current_user.live_broker && (
-            <Pressable
-              accessibilityRole="button"
-              accessibilityLabel="Clear live broker selection"
-              onPress={() => pickBroker(null)}
-              style={{ marginTop: space.sm }}
-            >
-              <Text style={{ color: colors.textSecondary, fontSize: 12 }}>
-                Clear selection →
-              </Text>
-            </Pressable>
-          )}
+
+          <Text style={[styles.metricLabel, { marginTop: space.md }]}>ROUTE LIVE ORDERS TO</Text>
+          <View style={{ flexDirection: "row", gap: 8, marginTop: space.xs }}>
+            {(["polymarket", "kalshi", null] as const).map((name) => {
+              const ready = name ? !!brokers?.venues?.[name]?.configured : true;
+              const active = brokers?.current_user.live_broker === name;
+              const label =
+                name === null ? "None" : name === "polymarket" ? "Polymarket" : "Kalshi";
+              return (
+                <Pressable
+                  key={name ?? "none"}
+                  accessibilityRole="button"
+                  accessibilityState={{ selected: active, disabled: !ready }}
+                  onPress={() => ready && !busy && pickBroker(name)}
+                  style={({ pressed }) => [
+                    styles.routePill,
+                    {
+                      borderColor: active ? colors.primary : colors.borderSubtle,
+                      backgroundColor: active ? colors.primary : "transparent",
+                      opacity: !ready ? 0.4 : pressed ? 0.7 : 1,
+                    },
+                  ]}
+                >
+                  <Text
+                    style={{
+                      color: active ? colors.textInverse : colors.textPrimary,
+                      fontSize: 12,
+                      fontWeight: "600",
+                    }}
+                  >
+                    {label}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+
           {brokers?.live_ingest === false && (
             <Text style={[styles.subtle, { marginTop: space.sm, color: colors.alpha }]}>
               ⚠ Live market data ingest is OFF. Set LIVE_INGEST_ENABLED=true in backend .env.
             </Text>
+          )}
+        </Card>
+
+        <Card>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            <Text style={[styles.metricLabel, { flex: 1 }]}>RISK LIMITS</Text>
+            <Pressable
+              accessibilityRole="button"
+              onPress={() => setRiskOpen(true)}
+              style={({ pressed }) => [styles.editPill, { opacity: pressed ? 0.6 : 1 }]}
+            >
+              <Feather name="sliders" size={12} color={colors.textPrimary} />
+              <Text style={{ color: colors.textPrimary, fontSize: 11, fontWeight: "600" }}>
+                EDIT
+              </Text>
+            </Pressable>
+          </View>
+          {risk ? (
+            <>
+              <View style={styles.row}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.rowLabel}>Daily Loss Circuit</Text>
+                  <Text style={styles.subtle}>
+                    Kills trades for the day if PnL ≤ {formatUsd(risk.preview.daily_loss_dollar)}
+                  </Text>
+                </View>
+                <Text style={styles.rowValue}>{(risk.daily_loss_pct * 100).toFixed(2)}%</Text>
+              </View>
+              <View style={styles.row}>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.rowLabel}>Per-Trade Cap</Text>
+                  <Text style={styles.subtle}>
+                    Max one trade: {formatUsd(risk.preview.max_trade_dollar)}
+                  </Text>
+                </View>
+                <Text style={styles.rowValue}>{(risk.max_trade_pct * 100).toFixed(2)}%</Text>
+              </View>
+              {risk.preview.circuit_tripped && (
+                <View style={styles.tripped}>
+                  <Feather name="alert-octagon" size={14} color={colors.negative} />
+                  <Text style={{ color: colors.negative, fontSize: 12, flex: 1 }}>
+                    Circuit TRIPPED — trading paused. Resets at UTC midnight.
+                  </Text>
+                </View>
+              )}
+            </>
+          ) : (
+            <Text style={styles.subtle}>Loading…</Text>
           )}
         </Card>
 
@@ -294,6 +474,20 @@ export default function SettingsScreen() {
         </Text>
         <View style={{ height: space.xl }} />
       </ScrollView>
+
+      {modalVenue && (
+        <BrokerConnectionModal
+          visible={!!modalVenue}
+          venue={modalVenue}
+          onClose={() => setModalVenue(null)}
+          onSaved={reload}
+        />
+      )}
+      <RiskLimitsModal
+        visible={riskOpen}
+        onClose={() => setRiskOpen(false)}
+        onSaved={reload}
+      />
     </SafeAreaView>
   );
 }
@@ -329,17 +523,66 @@ const styles = StyleSheet.create({
     paddingVertical: 8,
   },
   rowLabel: { color: colors.textPrimary, fontSize: 14 },
-  rowValue: { color: colors.textPrimary, fontWeight: "600" },
+  rowValue: { color: colors.textPrimary, fontWeight: "600", fontVariant: ["tabular-nums"] },
   brokerRow: {
     flexDirection: "row",
     alignItems: "center",
-    paddingVertical: 12,
+    paddingVertical: 10,
     paddingHorizontal: 12,
     borderRadius: 10,
     borderWidth: 1,
+    borderColor: colors.borderSubtle,
     marginBottom: 8,
+    gap: 8,
   },
   brokerName: { ...(typo.body as any), color: colors.textPrimary, fontWeight: "600" },
   brokerHint: { ...(typo.caption as any), color: colors.textSecondary, marginTop: 2 },
   statusDot: { width: 8, height: 8, borderRadius: 4 },
+  activeBadge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
+    backgroundColor: colors.positiveSoft,
+  },
+  activeBadgeText: {
+    color: colors.positive,
+    fontSize: 9,
+    fontWeight: "700",
+    letterSpacing: 0.6,
+  },
+  smallBtn: {
+    width: 32,
+    height: 32,
+    borderRadius: 8,
+    borderColor: colors.borderSubtle,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.modal,
+  },
+  routePill: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+  },
+  editPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: radius.pill,
+    borderWidth: 1,
+    borderColor: colors.borderSubtle,
+  },
+  tripped: {
+    flexDirection: "row",
+    gap: 6,
+    alignItems: "center",
+    padding: 8,
+    borderRadius: 8,
+    backgroundColor: colors.negativeSoft,
+    marginTop: space.sm,
+  },
 });

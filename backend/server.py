@@ -40,7 +40,16 @@ from pydantic import BaseModel, EmailStr, Field
 from markets import market_store, quote_to_dict
 from allocator import RiskConfig, allocate
 from engines import alpha as alpha_engine, quant as quant_engine, whale as whale_engine, micro as micro_engine
-from broker import get_broker, resolve_broker_for_user, is_live_configured
+from broker import (
+    get_broker,
+    resolve_broker_for_user,
+    resolve_broker_for_user_async,
+    is_live_configured,
+    load_user_broker_creds,
+    POLYMARKET_REQUIRED,
+    KALSHI_REQUIRED,
+)
+from crypto import encrypt_payload, fingerprint_for
 from live_market import LIVE_INGEST_ENABLED, ingest_forever
 from observability import (
     configure_json_logging,
@@ -131,6 +140,17 @@ ACCESS_TTL_MIN = 60 * 24  # 24h on mobile (refresh available)
 REFRESH_TTL_DAYS = 30
 DEFAULT_BANKROLL = 10_000.0
 INITIAL_BANKROLL = 10_000.0
+
+# ── Risk limit defaults (overridable per-user via PATCH /api/me/risk-limits) ──
+# Daily loss circuit breaker: kill trades once today's realized PnL drops below
+# -(starting_bankroll * daily_loss_pct). 0.05 = 5%.
+DEFAULT_DAILY_LOSS_PCT = 0.05
+# Per-trade size cap: a single trade can be at most max_trade_pct * bankroll.
+DEFAULT_MAX_TRADE_PCT = 0.02
+# Hard floor on user customisation — even if user overrides, never allow > 25%
+# daily loss or > 20% per-trade.  Mostly a UX safety rail.
+MAX_DAILY_LOSS_PCT = 0.25
+MAX_PER_TRADE_PCT = 0.20
 
 # Fail fast if someone deploys with the insecure default.
 _JWT_SECRET = os.environ.get("JWT_SECRET", "")
@@ -258,8 +278,44 @@ def public_user(u: dict) -> dict:
         "starting_bankroll": round(u.get("starting_bankroll", INITIAL_BANKROLL), 2),
         "paused_engines": u.get("paused_engines", []),
         "kill_switch": u.get("kill_switch", False),
+        "daily_loss_pct": float(u.get("daily_loss_pct", DEFAULT_DAILY_LOSS_PCT)),
+        "max_trade_pct": float(u.get("max_trade_pct", DEFAULT_MAX_TRADE_PCT)),
         "created_at": u.get("created_at", datetime.now(timezone.utc)).isoformat(),
     }
+
+
+def _risk_limits_for(user: dict) -> tuple[float, float]:
+    """Return (daily_loss_pct, max_trade_pct) for this user, clamped to safe bounds."""
+    dl = float(user.get("daily_loss_pct", DEFAULT_DAILY_LOSS_PCT) or DEFAULT_DAILY_LOSS_PCT)
+    mt = float(user.get("max_trade_pct", DEFAULT_MAX_TRADE_PCT) or DEFAULT_MAX_TRADE_PCT)
+    dl = max(0.005, min(MAX_DAILY_LOSS_PCT, dl))
+    mt = max(0.001, min(MAX_PER_TRADE_PCT, mt))
+    return dl, mt
+
+
+def _check_daily_loss_circuit(user: dict) -> None:
+    """Raise 400 if today's realized PnL has breached the daily loss circuit."""
+    dl_pct, _ = _risk_limits_for(user)
+    starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
+    realized_today = float(user.get("realized_pnl_today", 0.0))
+    threshold = -starting * dl_pct
+    if realized_today <= threshold:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Daily loss circuit tripped (lost ${abs(realized_today):.2f} / "
+                f"limit ${abs(threshold):.2f} = {dl_pct*100:.1f}% of starting bankroll). "
+                f"Trading paused until UTC midnight."
+            ),
+        )
+
+
+def _clamp_notional_to_cap(user: dict, notional: float) -> float:
+    """Cap `notional` to user's max_trade_pct * bankroll."""
+    _, mt_pct = _risk_limits_for(user)
+    bankroll = float(user.get("bankroll", INITIAL_BANKROLL))
+    cap = max(1.0, bankroll * mt_pct)
+    return min(notional, cap)
 
 
 async def get_current_user(request: Request) -> dict:
@@ -859,6 +915,8 @@ async def approve_trade(
     try:
         if user.get("kill_switch"):
             raise HTTPException(status_code=400, detail="Kill switch is active")
+        # Daily loss circuit breaker — hard kill all trading once breached.
+        _check_daily_loss_circuit(user)
 
         async with _engine_cache_lock:
             sig = _engine_cache["by_id"].get(payload.signal_id)
@@ -874,6 +932,18 @@ async def approve_trade(
             raise HTTPException(status_code=400, detail="Insufficient bankroll")
         notional = payload.notional or round(min(bankroll * sig["size_hint"], bankroll * 0.15), 2)
         notional = max(1.0, min(notional, bankroll * 0.95))
+        # Per-trade size cap (user-configurable risk limit).
+        capped = _clamp_notional_to_cap(user, notional)
+        if payload.notional is not None and float(payload.notional) > capped + 0.005:
+            _, mt_pct = _risk_limits_for(user)
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Trade exceeds per-trade cap (${float(payload.notional):.2f} > "
+                    f"${capped:.2f} = {mt_pct*100:.2f}% of bankroll)."
+                ),
+            )
+        notional = capped
 
         # Atomically debit bankroll BEFORE placing order; if debit fails, refuse.
         ok = await _atomic_bankroll_debit(user["_id"], notional)
@@ -881,7 +951,7 @@ async def approve_trade(
             raise HTTPException(status_code=400, detail="Insufficient bankroll")
 
         try:
-            broker = resolve_broker_for_user(user)
+            broker = await resolve_broker_for_user_async(db, user)
             fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
         except Exception as e:
             # Refund on broker failure.
@@ -958,6 +1028,7 @@ async def auto_deploy(
     try:
         if user.get("kill_switch"):
             raise HTTPException(status_code=400, detail="Kill switch is active")
+        _check_daily_loss_circuit(user)
         async with _engine_cache_lock:
             signals = list(_engine_cache["signals"])
 
@@ -970,11 +1041,13 @@ async def auto_deploy(
 
         deployed = []
         for order in plan["orders"][:3]:
+            # Re-clamp to per-trade cap (the allocator doesn't know user prefs).
+            order["notional"] = _clamp_notional_to_cap(user, float(order["notional"]))
             ok = await _atomic_bankroll_debit(user["_id"], order["notional"])
             if not ok:
                 break  # out of bankroll; stop deploying more
             try:
-                broker = resolve_broker_for_user(user)
+                broker = await resolve_broker_for_user_async(db, user)
                 fill = await broker.place_order(user_id=user_id, signal=order, notional=order["notional"])
             except Exception as e:
                 await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": order["notional"]}})
@@ -1284,17 +1357,24 @@ async def me_quota(user: dict = Depends(get_current_user)):
 
 @api.get("/brokers/status")
 async def brokers_status(user: dict = Depends(get_current_user)):
-    """Report which live brokers are configured on the server.
+    """Report which live brokers are usable for THIS user.
 
-    Lets the mobile app reflect a "Live mode unavailable for X" badge accurately
-    without exposing any credentials.
+    A venue is "configured" if EITHER the operator's env vars are set OR the
+    user has saved their own encrypted credentials in the broker_connections
+    collection. Never exposes any credentials.
     """
+    out_venues: Dict[str, Dict[str, Any]] = {}
+    for venue in ("polymarket", "kalshi"):
+        env_ready = is_live_configured(venue)
+        creds = await load_user_broker_creds(db, str(user["_id"]), venue)
+        user_ready = creds is not None and get_broker(venue, creds=creds).is_configured()  # type: ignore[attr-defined]
+        out_venues[venue] = {
+            "configured": bool(env_ready or user_ready),
+            "source": "user" if user_ready else ("env" if env_ready else None),
+        }
     return {
         "live_ingest": LIVE_INGEST_ENABLED,
-        "venues": {
-            "polymarket": {"configured": is_live_configured("polymarket")},
-            "kalshi": {"configured": is_live_configured("kalshi")},
-        },
+        "venues": out_venues,
         "current_user": {
             "live_mode": bool(user.get("live_mode")),
             "live_broker": user.get("live_broker") or None,
@@ -1308,15 +1388,238 @@ class LiveBrokerIn(BaseModel):
 
 @api.patch("/me/live-broker")
 async def set_live_broker(payload: LiveBrokerIn, user: dict = Depends(get_current_user)):
-    """Choose the venue routed to when live_mode is on. Refuses values whose env isn't ready."""
+    """Choose the venue routed to when live_mode is on. Refuses values whose creds aren't ready.
+
+    Credentials may come from the per-user `broker_connections` collection OR
+    operator env vars — either is acceptable.
+    """
     desired = (payload.broker or "").lower() or None
     if desired and desired not in ("polymarket", "kalshi"):
         raise HTTPException(status_code=400, detail="broker must be 'polymarket', 'kalshi', or null")
-    if desired and not is_live_configured(desired):
-        raise HTTPException(status_code=400, detail=f"{desired} not configured on server")
+    if desired:
+        creds = await load_user_broker_creds(db, str(user["_id"]), desired)
+        broker_inst = get_broker(desired, creds=creds)
+        configured = bool(getattr(broker_inst, "is_configured", lambda: False)())
+        if not configured:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No credentials for {desired}. Connect the broker in Settings first.",
+            )
     await db.users.update_one({"_id": user["_id"]}, {"$set": {"live_broker": desired}})
     await audit(str(user["_id"]), "user.live_broker_set", {"broker": desired})
     return {"ok": True, "live_broker": desired}
+
+
+# ---------- broker connections (in-app secure credential vault) ----------
+class BrokerConnIn(BaseModel):
+    venue: str  # "polymarket" | "kalshi"
+    # Polymarket fields
+    private_key: Optional[str] = None
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    api_passphrase: Optional[str] = None
+    # Kalshi fields
+    key_id: Optional[str] = None
+    private_key_pem: Optional[str] = None
+
+
+def _validate_broker_creds(venue: str, raw: dict) -> dict:
+    """Return a clean creds dict for `venue`, raising 400 on missing required fields."""
+    if venue == "polymarket":
+        creds = {k: (raw.get(k) or "").strip() for k in POLYMARKET_REQUIRED}
+        missing = [k for k in POLYMARKET_REQUIRED if not creds[k]]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Polymarket missing fields: {', '.join(missing)}")
+        # Lightweight sanity: private key should be 0x...64hex (66 chars) or 64 hex.
+        pk = creds["private_key"]
+        pk_hex = pk[2:] if pk.startswith("0x") else pk
+        if len(pk_hex) != 64 or not all(c in "0123456789abcdefABCDEF" for c in pk_hex):
+            raise HTTPException(status_code=400, detail="Polymarket private_key must be 64-char hex (optional 0x prefix)")
+        return creds
+    if venue == "kalshi":
+        creds = {k: (raw.get(k) or "").strip() for k in KALSHI_REQUIRED}
+        missing = [k for k in KALSHI_REQUIRED if not creds[k]]
+        if missing:
+            raise HTTPException(status_code=400, detail=f"Kalshi missing fields: {', '.join(missing)}")
+        if "BEGIN" not in creds["private_key_pem"] or "PRIVATE KEY" not in creds["private_key_pem"]:
+            raise HTTPException(status_code=400, detail="Kalshi private_key_pem must be a PEM-encoded key")
+        return creds
+    raise HTTPException(status_code=400, detail="venue must be 'polymarket' or 'kalshi'")
+
+
+def _public_broker_connection(row: dict) -> dict:
+    return {
+        "venue": row["venue"],
+        "fingerprint": row.get("fingerprint", "—"),
+        "status": row.get("status", "untested"),
+        "last_tested_at": row["last_tested_at"].isoformat() if row.get("last_tested_at") else None,
+        "last_test_result": row.get("last_test_result"),
+        "created_at": row["created_at"].isoformat() if row.get("created_at") else None,
+        "updated_at": row["updated_at"].isoformat() if row.get("updated_at") else None,
+    }
+
+
+@api.get("/me/broker-connections")
+async def list_broker_connections(user: dict = Depends(get_current_user)):
+    """List the user's stored broker connections — NEVER returns secret material."""
+    rows: List[dict] = []
+    async for r in db.broker_connections.find({"user_id": str(user["_id"])}).sort("venue", 1):
+        rows.append(_public_broker_connection(r))
+    return {"connections": rows}
+
+
+@api.post("/me/broker-connections")
+async def upsert_broker_connection(payload: BrokerConnIn, user: dict = Depends(get_current_user)):
+    """Encrypt & store a venue's credentials at-rest in Mongo.
+
+    Idempotent on (user_id, venue) — calling with the same venue overwrites.
+    """
+    venue = (payload.venue or "").lower()
+    raw = payload.model_dump(exclude_none=True)
+    raw.pop("venue", None)
+    creds = _validate_broker_creds(venue, raw)
+
+    # Encrypt → at-rest. The Fernet key (TRACKMIND_MASTER_KEY) is the only thing
+    # the operator must protect.
+    try:
+        encrypted = encrypt_payload(creds)
+    except RuntimeError as e:
+        # Almost always missing master key.
+        raise HTTPException(status_code=500, detail=str(e))
+    fp = fingerprint_for(venue, creds)
+    now = datetime.now(timezone.utc)
+    await db.broker_connections.update_one(
+        {"user_id": str(user["_id"]), "venue": venue},
+        {
+            "$set": {
+                "encrypted_payload": encrypted,
+                "fingerprint": fp,
+                "status": "untested",
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "user_id": str(user["_id"]),
+                "venue": venue,
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+    await audit(str(user["_id"]), "broker.connect", {"venue": venue, "fingerprint": fp})
+    row = await db.broker_connections.find_one({"user_id": str(user["_id"]), "venue": venue})
+    return _public_broker_connection(row or {})
+
+
+@api.post("/me/broker-connections/test")
+async def test_broker_connection(payload: BrokerConnIn, user: dict = Depends(get_current_user)):
+    """Run an authenticated probe against the venue using the stored creds.
+
+    If `payload` includes credential fields, those are used (allows "test before save").
+    Otherwise we decrypt the user's saved record.
+    """
+    venue = (payload.venue or "").lower()
+    raw = payload.model_dump(exclude_none=True)
+    raw.pop("venue", None)
+    creds: Optional[dict] = None
+    if any(raw.get(k) for k in (POLYMARKET_REQUIRED + KALSHI_REQUIRED)):
+        creds = _validate_broker_creds(venue, raw)
+    else:
+        creds = await load_user_broker_creds(db, str(user["_id"]), venue)
+        if not creds:
+            raise HTTPException(status_code=404, detail="No saved connection for that venue")
+
+    broker_inst = get_broker(venue, creds=creds)
+    result = await broker_inst.test_connection()  # type: ignore[attr-defined]
+    now = datetime.now(timezone.utc)
+    # Persist the test outcome on the saved row (if one exists).
+    await db.broker_connections.update_one(
+        {"user_id": str(user["_id"]), "venue": venue},
+        {
+            "$set": {
+                "status": "active" if result.get("ok") else "failed",
+                "last_tested_at": now,
+                "last_test_result": result.get("detail", ""),
+            }
+        },
+    )
+    await audit(str(user["_id"]), "broker.test", {"venue": venue, "ok": bool(result.get("ok"))})
+    return {"ok": bool(result.get("ok")), "detail": result.get("detail", "")}
+
+
+@api.delete("/me/broker-connections/{venue}")
+async def delete_broker_connection(venue: str, user: dict = Depends(get_current_user)):
+    venue = venue.lower()
+    if venue not in ("polymarket", "kalshi"):
+        raise HTTPException(status_code=400, detail="venue must be 'polymarket' or 'kalshi'")
+    res = await db.broker_connections.delete_one({"user_id": str(user["_id"]), "venue": venue})
+    # If the active live_broker was this venue, clear it so we don't dangle.
+    if (user.get("live_broker") or "").lower() == venue:
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            {"$set": {"live_broker": None, "live_mode": False}},
+        )
+    await audit(str(user["_id"]), "broker.disconnect", {"venue": venue})
+    return {"ok": True, "deleted": res.deleted_count}
+
+
+# ---------- risk limits ----------
+class RiskLimitsIn(BaseModel):
+    daily_loss_pct: Optional[float] = None  # e.g. 0.05 = 5% of starting bankroll
+    max_trade_pct: Optional[float] = None   # e.g. 0.02 = 2% of bankroll per trade
+
+
+@api.get("/me/risk-limits")
+async def get_risk_limits(user: dict = Depends(get_current_user)):
+    dl, mt = _risk_limits_for(user)
+    starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
+    bankroll = float(user.get("bankroll", INITIAL_BANKROLL))
+    realized_today = float(user.get("realized_pnl_today", 0.0))
+    daily_loss_dollar = -starting * dl
+    return {
+        "daily_loss_pct": round(dl, 4),
+        "max_trade_pct": round(mt, 4),
+        "defaults": {
+            "daily_loss_pct": DEFAULT_DAILY_LOSS_PCT,
+            "max_trade_pct": DEFAULT_MAX_TRADE_PCT,
+        },
+        "caps": {
+            "daily_loss_pct_max": MAX_DAILY_LOSS_PCT,
+            "max_trade_pct_max": MAX_PER_TRADE_PCT,
+        },
+        "preview": {
+            "daily_loss_dollar": round(daily_loss_dollar, 2),
+            "max_trade_dollar": round(bankroll * mt, 2),
+            "realized_pnl_today": round(realized_today, 2),
+            "circuit_tripped": realized_today <= daily_loss_dollar,
+        },
+    }
+
+
+@api.patch("/me/risk-limits")
+async def update_risk_limits(payload: RiskLimitsIn, user: dict = Depends(get_current_user)):
+    update: dict = {}
+    if payload.daily_loss_pct is not None:
+        dl = float(payload.daily_loss_pct)
+        if dl <= 0 or dl > MAX_DAILY_LOSS_PCT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"daily_loss_pct must be in (0, {MAX_DAILY_LOSS_PCT}]",
+            )
+        update["daily_loss_pct"] = dl
+    if payload.max_trade_pct is not None:
+        mt = float(payload.max_trade_pct)
+        if mt <= 0 or mt > MAX_PER_TRADE_PCT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"max_trade_pct must be in (0, {MAX_PER_TRADE_PCT}]",
+            )
+        update["max_trade_pct"] = mt
+    if not update:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+    await db.users.update_one({"_id": user["_id"]}, {"$set": update})
+    await audit(str(user["_id"]), "risk_limits.update", update)
+    user = await db.users.find_one({"_id": user["_id"]})
+    return await get_risk_limits(user)  # type: ignore[arg-type]
 
 
 
@@ -1486,6 +1789,8 @@ async def on_startup():
     await db.revoked_tokens.create_index("exp", expireAfterSeconds=0)
     await db.idempotency_keys.create_index([("user_id", 1), ("key", 1)], unique=True)
     await db.idempotency_keys.create_index("created_at", expireAfterSeconds=600)  # 10 min
+    # Broker connections — encrypted at-rest per user/venue.
+    await db.broker_connections.create_index([("user_id", 1), ("venue", 1)], unique=True)
     # Audit log retention (30 days) — drop any pre-existing ts index then create TTL.
     try:
         await db.audit_logs.drop_index("ts_1")

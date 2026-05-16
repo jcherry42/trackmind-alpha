@@ -1,13 +1,15 @@
 """Broker adapters.
 
 The PaperBroker is fully functional (no external venue). Polymarket and Kalshi
-adapters now implement real REST flows but are GATED off by default:
-    USER must have live_mode=True
-  AND USER's live_broker preference must be set to "polymarket" or "kalshi"
-  AND the env vars listed below must be present.
+adapters implement real REST flows.
 
-If any precondition is unmet, calls fall back to PaperBroker so paper-only
-deployments keep working.
+Credentials come from one of two sources, in priority order:
+    1. Explicit `creds` dict passed at construction (loaded per-user from the
+       Mongo `broker_connections` collection, decrypted with TRACKMIND_MASTER_KEY).
+    2. Environment variables (operator-wide fallback).
+
+If neither yields a complete credential set, the live broker raises
+RuntimeError on `.place_order(...)` and the caller falls back to PaperBroker.
 """
 from __future__ import annotations
 
@@ -61,38 +63,43 @@ class PaperBroker(BaseBroker):
 
 
 # ----------------- Polymarket -----------------
+POLYMARKET_REQUIRED = ("private_key", "api_key", "api_secret", "api_passphrase")
+
+
 class PolymarketBroker(BaseBroker):
     """Place limit orders on Polymarket CLOB via the official REST endpoint.
 
-    Requires env:
-      POLYMARKET_PRIVATE_KEY   — hex private key of an EOA funded with USDC.e on Polygon
-      POLYMARKET_API_KEY       — L2 API credential (from `derive_api_key`)
-      POLYMARKET_API_SECRET    — L2 API secret
-      POLYMARKET_API_PASSPHRASE — L2 API passphrase
-      POLYMARKET_HOST (optional) — defaults to https://clob.polymarket.com
-
-    NB: This adapter intentionally does NOT pull in the heavy `py-clob-client`
-    SDK at import time so paper-only deployments stay lean. The SDK is imported
-    lazily on first .place_order() — install it via:
-        pip install py-clob-client web3
+    Required credentials (dict keys, or POLYMARKET_* env vars):
+      private_key       — hex EOA private key funded with USDC.e on Polygon
+      api_key           — L2 API credential (from `derive_api_key`)
+      api_secret        — L2 API secret
+      api_passphrase    — L2 API passphrase
     """
     name = "polymarket"
-    host = os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com")
 
-    def __init__(self) -> None:
+    def __init__(self, creds: Optional[Dict[str, str]] = None) -> None:
+        self.host = os.environ.get("POLYMARKET_HOST", "https://clob.polymarket.com")
+        self._creds = self._resolve_creds(creds or {})
         self._client: Any = None  # lazily-built py_clob_client.ClobClient
+
+    @staticmethod
+    def _resolve_creds(creds: Dict[str, str]) -> Dict[str, str]:
+        return {
+            "private_key": creds.get("private_key") or os.environ.get("POLYMARKET_PRIVATE_KEY", ""),
+            "api_key": creds.get("api_key") or os.environ.get("POLYMARKET_API_KEY", ""),
+            "api_secret": creds.get("api_secret") or os.environ.get("POLYMARKET_API_SECRET", ""),
+            "api_passphrase": creds.get("api_passphrase") or os.environ.get("POLYMARKET_API_PASSPHRASE", ""),
+        }
+
+    def is_configured(self) -> bool:
+        return all(self._creds.get(k) for k in POLYMARKET_REQUIRED)
 
     def _ensure_client(self) -> Any:
         if self._client is not None:
             return self._client
-        for k in (
-            "POLYMARKET_PRIVATE_KEY",
-            "POLYMARKET_API_KEY",
-            "POLYMARKET_API_SECRET",
-            "POLYMARKET_API_PASSPHRASE",
-        ):
-            if not os.environ.get(k):
-                raise RuntimeError(f"Missing {k}")
+        if not self.is_configured():
+            missing = [k for k in POLYMARKET_REQUIRED if not self._creds.get(k)]
+            raise RuntimeError(f"polymarket missing credentials: {','.join(missing)}")
         try:
             from py_clob_client.client import ClobClient  # type: ignore
             from py_clob_client.clob_types import ApiCreds  # type: ignore
@@ -100,24 +107,36 @@ class PolymarketBroker(BaseBroker):
             raise RuntimeError(
                 "py-clob-client not installed; run `pip install py-clob-client web3`"
             ) from e
-        self._client = ClobClient(
-            host=self.host,
-            chain_id=137,  # Polygon
-            key=os.environ["POLYMARKET_PRIVATE_KEY"],
-        )
+        self._client = ClobClient(host=self.host, chain_id=137, key=self._creds["private_key"])
         self._client.set_api_creds(
             ApiCreds(
-                api_key=os.environ["POLYMARKET_API_KEY"],
-                api_secret=os.environ["POLYMARKET_API_SECRET"],
-                api_passphrase=os.environ["POLYMARKET_API_PASSPHRASE"],
+                api_key=self._creds["api_key"],
+                api_secret=self._creds["api_secret"],
+                api_passphrase=self._creds["api_passphrase"],
             )
         )
         return self._client
 
+    async def test_connection(self) -> Dict[str, Any]:
+        """Probe credentials without placing an order. Returns {ok, detail}."""
+        import asyncio
+        if not self.is_configured():
+            missing = [k for k in POLYMARKET_REQUIRED if not self._creds.get(k)]
+            return {"ok": False, "detail": f"missing: {','.join(missing)}"}
+
+        def _probe() -> Dict[str, Any]:
+            try:
+                client = self._ensure_client()
+                # `get_api_keys()` is an authenticated GET — confirms HMAC works.
+                resp = client.get_api_keys()
+                return {"ok": True, "detail": f"authenticated · {len(resp or [])} api keys"}
+            except Exception as e:  # noqa: BLE001
+                return {"ok": False, "detail": str(e)[:200]}
+
+        return await asyncio.to_thread(_probe)
+
     async def place_order(self, *, user_id: str, signal: dict, notional: float) -> Dict[str, Any]:
         import asyncio
-
-        # token_id is required by the CLOB; expected to be on the signal courtesy of live_market.py.
         token_ids = signal.get("polymarket_token_ids") or signal.get("clobTokenIds") or []
         if not token_ids or len(token_ids) < 2:
             raise RuntimeError("polymarket_token_ids missing on signal — fetch markets via live_market.py")
@@ -129,12 +148,7 @@ class PolymarketBroker(BaseBroker):
         def _submit() -> Dict[str, Any]:
             client = self._ensure_client()
             from py_clob_client.clob_types import OrderArgs, OrderType  # type: ignore
-            args = OrderArgs(
-                price=price,
-                size=size_shares,
-                side="BUY",   # we always BUY shares of the chosen outcome
-                token_id=token_id,
-            )
+            args = OrderArgs(price=price, size=size_shares, side="BUY", token_id=token_id)
             signed = client.create_order(args)
             resp = client.post_order(signed, OrderType.GTC)
             return resp
@@ -145,8 +159,7 @@ class PolymarketBroker(BaseBroker):
             raise RuntimeError(f"polymarket order failed: {e}") from e
 
         order_id = resp.get("orderID") or resp.get("orderId") or f"polymarket_{uuid.uuid4().hex[:10]}"
-        fee_bps = 200  # Polymarket charges up to 2% on taker side; conservative reserve
-        fees = round(notional * fee_bps / 10_000, 4)
+        fees = round(notional * 0.02, 4)  # ~2% taker reserve
         return {
             "id": str(order_id),
             "broker": self.name,
@@ -167,33 +180,39 @@ class PolymarketBroker(BaseBroker):
 
 
 # ----------------- Kalshi -----------------
+KALSHI_REQUIRED = ("key_id", "private_key_pem")
+
+
 class KalshiBroker(BaseBroker):
     """Place limit orders on Kalshi via the v2 REST API.
 
-    Requires env:
-      KALSHI_KEY_ID            — UUID from the dashboard
-      KALSHI_PRIVATE_KEY_PEM   — full PEM contents of the downloaded private key
-      KALSHI_BASE (optional)   — defaults to https://api.elections.kalshi.com/trade-api/v2
-
-    Signing scheme (RSA-PSS over SHA-256):
-        msg     = timestamp_ms_str + method + path
-        header  = {
-            KALSHI-ACCESS-KEY:       <key_id>,
-            KALSHI-ACCESS-TIMESTAMP: <timestamp_ms_str>,
-            KALSHI-ACCESS-SIGNATURE: base64(rsa_sign(msg))
-        }
+    Required credentials (dict keys, or KALSHI_* env vars):
+      key_id            — UUID from the dashboard
+      private_key_pem   — full PEM contents of the downloaded private key
     """
     name = "kalshi"
-    base = os.environ.get("KALSHI_BASE", "https://api.elections.kalshi.com/trade-api/v2")
+
+    def __init__(self, creds: Optional[Dict[str, str]] = None) -> None:
+        self.base = os.environ.get("KALSHI_BASE", "https://api.elections.kalshi.com/trade-api/v2")
+        self._creds = self._resolve_creds(creds or {})
+
+    @staticmethod
+    def _resolve_creds(creds: Dict[str, str]) -> Dict[str, str]:
+        return {
+            "key_id": creds.get("key_id") or os.environ.get("KALSHI_KEY_ID", ""),
+            "private_key_pem": creds.get("private_key_pem") or os.environ.get("KALSHI_PRIVATE_KEY_PEM", ""),
+        }
+
+    def is_configured(self) -> bool:
+        return all(self._creds.get(k) for k in KALSHI_REQUIRED)
 
     def _sign_headers(self, method: str, path: str) -> Dict[str, str]:
         from cryptography.hazmat.primitives import hashes, serialization
         from cryptography.hazmat.primitives.asymmetric import padding
-        pem = os.environ.get("KALSHI_PRIVATE_KEY_PEM")
-        key_id = os.environ.get("KALSHI_KEY_ID")
-        if not pem or not key_id:
-            raise RuntimeError("KALSHI_KEY_ID and KALSHI_PRIVATE_KEY_PEM required")
-        priv = serialization.load_pem_private_key(pem.encode(), password=None)
+        if not self.is_configured():
+            missing = [k for k in KALSHI_REQUIRED if not self._creds.get(k)]
+            raise RuntimeError(f"kalshi missing credentials: {','.join(missing)}")
+        priv = serialization.load_pem_private_key(self._creds["private_key_pem"].encode(), password=None)
         ts = str(int(time.time() * 1000))
         msg = (ts + method.upper() + path).encode()
         sig = priv.sign(
@@ -202,11 +221,27 @@ class KalshiBroker(BaseBroker):
             hashes.SHA256(),
         )
         return {
-            "KALSHI-ACCESS-KEY": key_id,
+            "KALSHI-ACCESS-KEY": self._creds["key_id"],
             "KALSHI-ACCESS-TIMESTAMP": ts,
             "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
             "Content-Type": "application/json",
         }
+
+    async def test_connection(self) -> Dict[str, Any]:
+        """Probe credentials by hitting an authenticated read endpoint."""
+        if not self.is_configured():
+            missing = [k for k in KALSHI_REQUIRED if not self._creds.get(k)]
+            return {"ok": False, "detail": f"missing: {','.join(missing)}"}
+        try:
+            path = "/trade-api/v2/portfolio/balance"
+            headers = self._sign_headers("GET", path)
+            async with httpx.AsyncClient(base_url=self.base, timeout=10.0) as client:
+                r = await client.get("/portfolio/balance", headers=headers)
+            if r.status_code == 200:
+                return {"ok": True, "detail": "authenticated"}
+            return {"ok": False, "detail": f"http {r.status_code}: {r.text[:160]}"}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "detail": str(e)[:200]}
 
     async def place_order(self, *, user_id: str, signal: dict, notional: float) -> Dict[str, Any]:
         ticker = signal.get("kalshi_ticker")
@@ -247,7 +282,7 @@ class KalshiBroker(BaseBroker):
             "price": round(price, 4),
             "contracts": count,
             "notional": round(notional, 2),
-            "fees": round(notional * 0.07 * (1 - price), 4),  # Kalshi fee = 7% × p × (1−p), conservative
+            "fees": round(notional * 0.07 * (1 - price), 4),
             "status": "submitted",
             "ts": time.time(),
             "raw": order,
@@ -255,45 +290,80 @@ class KalshiBroker(BaseBroker):
 
 
 # ----------------- factory -----------------
-def get_broker(name: str) -> BaseBroker:
+def get_broker(name: str, creds: Optional[Dict[str, str]] = None) -> BaseBroker:
     n = (name or "paper").lower()
     if n == "paper":
         return PaperBroker()
     if n == "polymarket":
-        return PolymarketBroker()
+        return PolymarketBroker(creds)
     if n == "kalshi":
-        return KalshiBroker()
+        return KalshiBroker(creds)
     raise ValueError(f"Unknown broker: {name}")
 
 
-def is_live_configured(name: str) -> bool:
-    """True if all env vars for the named live broker are present."""
+def env_is_live_configured(name: str) -> bool:
+    """True if env-only credentials for the named live broker are present (no DB lookup)."""
     n = (name or "").lower()
     if n == "polymarket":
-        return all(
-            os.environ.get(k)
-            for k in (
-                "POLYMARKET_PRIVATE_KEY",
-                "POLYMARKET_API_KEY",
-                "POLYMARKET_API_SECRET",
-                "POLYMARKET_API_PASSPHRASE",
-            )
-        )
+        return PolymarketBroker().is_configured()
     if n == "kalshi":
-        return bool(os.environ.get("KALSHI_KEY_ID") and os.environ.get("KALSHI_PRIVATE_KEY_PEM"))
+        return KalshiBroker().is_configured()
     return False
 
 
-def resolve_broker_for_user(user: dict) -> BaseBroker:
-    """Pick the right broker for a user, falling back to paper if anything's misconfigured."""
+# Backwards-compat alias used by older callers — same behaviour as env-only check.
+is_live_configured = env_is_live_configured
+
+
+async def load_user_broker_creds(db, user_id: str, venue: str) -> Optional[Dict[str, str]]:
+    """Look up & decrypt a user's stored credentials for `venue`. Returns None if absent."""
+    from crypto import decrypt_payload
+    row = await db.broker_connections.find_one({"user_id": str(user_id), "venue": venue})
+    if not row or not row.get("encrypted_payload"):
+        return None
+    try:
+        return decrypt_payload(row["encrypted_payload"])
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"broker creds decrypt failed for {user_id}/{venue}: {e}")
+        return None
+
+
+async def resolve_broker_for_user_async(db, user: dict) -> BaseBroker:
+    """Pick the right broker for a user, loading per-user creds from Mongo.
+
+    Falls back to env, then to PaperBroker — never raises.
+    """
     if not user.get("live_mode"):
         return PaperBroker()
     desired = (user.get("live_broker") or "").lower()
-    if desired in ("polymarket", "kalshi") and is_live_configured(desired):
-        return get_broker(desired)
-    # Live requested but venue not ready → fall back, never crash a user trade.
+    if desired not in ("polymarket", "kalshi"):
+        return PaperBroker()
+    creds = await load_user_broker_creds(db, str(user["_id"]), desired)
+    broker = get_broker(desired, creds=creds)
+    # Final readiness check — be conservative.
+    if hasattr(broker, "is_configured") and not broker.is_configured():  # type: ignore[attr-defined]
+        logger.warning(
+            f"live_mode='{desired}' but no creds (db or env) — falling back to paper",
+            extra={"user_id": str(user.get("_id"))},
+        )
+        return PaperBroker()
+    return broker
+
+
+def resolve_broker_for_user(user: dict) -> BaseBroker:
+    """Legacy sync resolver kept for tests. Uses env-only creds.
+
+    New code MUST use `resolve_broker_for_user_async(db, user)`.
+    """
+    if not user.get("live_mode"):
+        return PaperBroker()
+    desired = (user.get("live_broker") or "").lower()
+    if desired in ("polymarket", "kalshi"):
+        b = get_broker(desired)
+        if hasattr(b, "is_configured") and b.is_configured():  # type: ignore[attr-defined]
+            return b
     logger.warning(
-        f"live_mode requested but '{desired}' not configured — falling back to paper",
+        f"sync resolver: '{desired}' not env-configured — falling back to paper",
         extra={"user_id": str(user.get("_id"))},
     )
     return PaperBroker()

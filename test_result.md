@@ -350,7 +350,9 @@ metadata:
   run_ui: false
 
 test_plan:
-  current_focus: []
+  current_focus:
+    - "Phase D — Secure in-app broker credential vault"
+    - "Phase D — Daily loss circuit breaker + per-trade size cap"
   stuck_tasks: []
   test_all: false
   test_priority: "high_first"
@@ -669,3 +671,83 @@ phase5:
       - working: true
         agent: "main"
         comment: "Modal screens registered in root Stack. Settings has links. Drafted placeholder text covers: who we are, data collected, sharing, retention, security, rights, eligibility, paper-vs-live, no investment advice, acceptable use, fees, termination, disclaimers, governing law, contacts."
+
+  - task: "Phase D — Secure in-app broker credential vault"
+    implemented: true
+    working: "NA"
+    file: "backend/crypto.py, backend/broker.py, backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          New endpoints:
+            GET    /api/me/broker-connections   — list (NO secrets, only venue+fingerprint+status)
+            POST   /api/me/broker-connections   — encrypt + upsert (Fernet, TRACKMIND_MASTER_KEY)
+            POST   /api/me/broker-connections/test — auth probe; uses payload creds or stored creds
+            DELETE /api/me/broker-connections/{venue}
+          PolymarketBroker / KalshiBroker refactored to accept per-user creds dict at __init__;
+          fall back to env if missing.  resolve_broker_for_user_async() decrypts user creds from
+          db.broker_connections and passes them to the broker.  approve_trade and auto_deploy now
+          call the async resolver so live mode routes to per-user creds first.
+          New collection: broker_connections {user_id, venue, encrypted_payload, fingerprint,
+          status, last_tested_at, last_test_result, created_at, updated_at}  unique on (user_id, venue).
+          GET /api/brokers/status now reports per-user readiness (source: "user" | "env" | null).
+          Manual smoke tests via curl: validation rejects bad keys (400); encrypts + stores OK;
+          GET returns no secret material; DELETE clears + nullifies live_broker if matched.
+          Master key generated and added to backend/.env (TRACKMIND_MASTER_KEY).
+  - task: "Phase D — Daily loss circuit breaker + per-trade size cap"
+    implemented: true
+    working: "NA"
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          New per-user limit fields with safe defaults:
+            daily_loss_pct (default 0.05 — 5% of starting bankroll)
+            max_trade_pct  (default 0.02 — 2% of bankroll)
+          Hard caps: daily_loss_pct ∈ (0, 0.25], max_trade_pct ∈ (0, 0.20].
+          New endpoints:
+            GET   /api/me/risk-limits  — returns current + defaults + caps + $ preview + circuit flag
+            PATCH /api/me/risk-limits  — updates daily_loss_pct and/or max_trade_pct (bounds-checked)
+          Enforcement:
+            approve_trade  — _check_daily_loss_circuit() trips 400 BEFORE any debit. _clamp_notional_to_cap()
+                             rejects user-supplied notional > cap; otherwise clamps auto-sized notional.
+            auto_deploy    — same circuit check + clamps each order's notional to the cap.
+          public_user() now exposes daily_loss_pct + max_trade_pct so the mobile app can read them.
+          Manual curl confirms: 50% override returns 400, valid 5% override sticks, max_trade_dollar
+          reflects bankroll * pct, circuit_tripped flag computed correctly.
+
+frontend:
+  - task: "Phase D — Broker connection modal + Risk limits modal in Settings"
+    implemented: true
+    working: "NA"
+    file: "frontend/components/BrokerConnectionModal.tsx, frontend/components/RiskLimitsModal.tsx, frontend/app/settings.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: "NA"
+        agent: "main"
+        comment: |
+          BrokerConnectionModal — bottom sheet w/ Polymarket (private_key, api_key, api_secret,
+          api_passphrase) or Kalshi (key_id, private_key_pem) fields; secrets masked w/ eye toggle;
+          TEST CONNECTION posts to /api/me/broker-connections/test and surfaces success/detail
+          in Snackbar; SAVE ENCRYPTED upserts the encrypted payload via POST /api/me/broker-connections.
+          RiskLimitsModal — pct inputs for daily loss + per-trade cap, live $ preview, alert block
+          if circuit currently tripped; PATCH /api/me/risk-limits on save.
+          Settings screen rewritten:
+            BROKER CONNECTIONS card — per-venue row with status dot, fingerprint, ACTIVE badge,
+            and Test (⚡) / Edit/Connect (+/✎) / Disconnect (🗑) actions; "Route Live Orders To"
+            segmented pill row (Polymarket / Kalshi / None).
+            RISK LIMITS card — shows current pcts + $ equivalents + circuit-tripped warning, with
+            an EDIT pill that opens the RiskLimitsModal.
+          Verified visually in web preview: modal renders correctly, eye toggle works, form has
+          monospace input for keys, hint text appears for both venues. Backend curl smoke also
+          validated upstream.
