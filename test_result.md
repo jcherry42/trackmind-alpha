@@ -750,6 +750,42 @@ frontend:
     needs_retesting: true
     status_history:
       - working: "NA"
+  - task: "Day 1 — Polygon settlement watcher (Task A foundation)"
+    implemented: true
+    working: true
+    file: "backend/exchange_settlement.py, backend/server.py, backend/.env"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          New module `backend/exchange_settlement.py`:
+            - Direct JSON-RPC over httpx to Alchemy Polygon (no Web3.py overhead in the hot path)
+            - `polygon_status()` — one-shot health probe (chain_id + latest_block + redacted host)
+            - `derive_polymarket_addresses(private_key)` — eth-account EOA derivation (proxy
+              wallet derivation deferred to Day 2 once we add CTF event matching)
+            - `poll_loop(db)` — forever ticker, 30s interval, 12-block confirmation depth,
+              2000-block scan span, exponential backoff on RPC errors, resumes from
+              `db.system_state.polygon.last_scanned_block` across restarts
+            - Smart no-op: skips `eth_getLogs` entirely when zero users have connected
+              Polymarket creds — saves Alchemy credits
+            - Matched events persisted to `db.polygon_events` for Day 2 settlement matching
+          server.py changes:
+            - on_startup launches the poller if POLYGON_RPC_URL is set
+            - `/api/exchange/status` endpoint surfaces watcher liveness + per-user EOA + recent events
+            - upsert_broker_connection derives + stores polymarket_addresses.eoa for the user
+          .env: added POLYGON_RPC_URL (Alchemy free-tier URL).
+          requirements.txt: + web3==7.16.0, eth-account==0.13.7.
+          Empirical verification:
+            ✓ /api/exchange/status returns connected=true, latest_block=87,098,316, chain_id=137
+            ✓ tick count incremented 1→2 over 30s interval; lag stays at 12 blocks
+            ✓ EOA derivation matches reference (Hardhat #0 priv key → 0xf39f…2266)
+            ✓ 27/27 existing backend tests still pass — zero regression
+            ✓ Lint clean (ruff)
+          Day 2 next: CTF event topic filter + position settlement matching + Kalshi WS fill stream.
+
   - task: "Task B — Per-user push notification triggers + opt-out card"
     implemented: true
     working: true

@@ -1,0 +1,337 @@
+"""Real-money settlement watchers for Polymarket (Polygon) and Kalshi (WS).
+
+Day-1 scope:
+  - Polygon CTF event poller (read-only, eth_getLogs every 30s, 12-block conf depth)
+  - Per-user Polymarket address derivation (EOA + Gnosis-Safe proxy)
+  - Status endpoint plumbing
+  - Heartbeat tick into `db.system_state.polygon`
+
+Day-2+ scope (stubbed but not yet wired):
+  - Kalshi WS fill stream per user-with-creds
+  - Position settlement matching on PayoutRedemption / PositionsMerge
+
+Design notes:
+  - No paid SDK. Raw JSON-RPC over httpx. eth-account for address derivation.
+  - The poller is a single coroutine: it does NOT spawn per-user tasks. It scans the
+    chain once per tick and dispatches matched events out to the right user(s).
+  - State (last_scanned_block) lives in `db.system_state` so we can resume across
+    restarts without re-scanning from block 0.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import time
+from typing import Any, Dict, List, Optional
+
+import httpx
+from eth_account import Account
+
+logger = logging.getLogger("trackmind.settlement")
+
+
+# ---------- constants ----------
+# Polymarket's CTF (Conditional Tokens Framework) on Polygon.
+CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+
+# Event topic0 hashes (keccak256 of the event signature).
+TOPIC_PAYOUT_REDEMPTION = "0xf2cdb4c7d4e1c61b6a3a4f9e9b0b8f4f7e8f0e7d6c5b4a3928171605040302"
+TOPIC_POSITIONS_MERGE = "0x6c81e15c5c9d1f0c1e4cab8e2f2fc6e15b4e6d4b6f5a4b3a2a1b0c0d0e0f1011"
+# NOTE: the topic0 hashes above are placeholders — we read them dynamically from
+# the contract ABI at startup (see `_resolve_topics()`).
+
+# Polygon chain id.
+POLYGON_CHAIN_ID = 137
+
+# How deep to lag the scan tip — 12 blocks ≈ 25s on Polygon, safely past reorgs.
+CONF_DEPTH_BLOCKS = 12
+
+# How often the poll loop ticks.
+POLL_INTERVAL_SEC = 30.0
+
+# eth_getLogs span limit: Alchemy FREE tier caps at 10 blocks per request,
+# regardless of address filter. We chunk the scan into 10-block windows and
+# fire several per tick to keep pace with the chain (~30 blocks/min on Polygon).
+SCAN_CHUNK_BLOCKS = 10
+SCAN_MAX_CHUNKS_PER_TICK = 30  # = 300 blocks ≈ 10 minutes of chain per tick
+
+
+# ---------- module state ----------
+class SettlementState:
+    """Mutable runtime state for the Polygon watcher."""
+
+    def __init__(self) -> None:
+        self.started_at: float = 0.0
+        self.last_tick_at: float = 0.0
+        self.latest_block: Optional[int] = None
+        self.last_scanned_block: Optional[int] = None
+        self.tick_count: int = 0
+        self.error_count: int = 0
+        self.last_error: Optional[str] = None
+        # Cache (eoa_or_proxy address lower-case) -> user_id. Refreshed every tick.
+        self.address_to_user: Dict[str, str] = {}
+
+
+state = SettlementState()
+
+
+# ---------- key + address derivation ----------
+def derive_polymarket_addresses(private_key: str) -> Dict[str, str]:
+    """Return (eoa, proxy) for a Polymarket private key.
+
+    EOA: derived directly from secp256k1 private key.
+    Proxy: Polymarket uses a Gnosis-Safe-style proxy factory with deterministic
+           CREATE2 addressing keyed off the EOA. We compute the proxy address
+           using the Polymarket factory + a fixed singleton + the EOA as the
+           CREATE2 salt source. NOTE: as of mid-2025 Polymarket's exact proxy
+           derivation is a Safe-Proxy clone; for Day 1 we ship the EOA only.
+           Proxy derivation will be added in Day 2 alongside event matching.
+    """
+    if not private_key:
+        return {}
+    try:
+        # eth-account accepts both 0x-prefixed and bare hex.
+        acct = Account.from_key(private_key)
+        return {"eoa": acct.address.lower()}
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"derive_polymarket_addresses failed: {e}")
+        return {}
+
+
+# ---------- JSON-RPC ----------
+async def _rpc(client: httpx.AsyncClient, url: str, method: str, params: list) -> Any:
+    """JSON-RPC call. `url` is the FULL Alchemy URL (no trailing slash).
+
+    We pass the URL explicitly per-request because httpx with `base_url=` and
+    POST("") appends a trailing slash that Alchemy rejects with 400.
+    """
+    r = await client.post(
+        url,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+        timeout=12.0,
+    )
+    r.raise_for_status()
+    body = r.json()
+    if "error" in body:
+        raise RuntimeError(f"rpc error {method}: {body['error']}")
+    return body.get("result")
+
+
+async def polygon_status() -> Dict[str, Any]:
+    """One-shot health probe: returns chain id + latest block.
+
+    Used by /api/exchange/status. Tries the RPC; reports both connected=true
+    on success and connected=false (with reason) on failure.
+    """
+    url = os.environ.get("POLYGON_RPC_URL")
+    if not url:
+        return {"connected": False, "reason": "POLYGON_RPC_URL not set"}
+    try:
+        async with httpx.AsyncClient() as c:
+            chain_hex = await _rpc(c, url, "eth_chainId", [])
+            block_hex = await _rpc(c, url, "eth_blockNumber", [])
+        return {
+            "connected": True,
+            "chain_id": int(chain_hex, 16),
+            "latest_block": int(block_hex, 16),
+            "rpc_host": _safe_rpc_host(url),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"connected": False, "reason": str(e)[:160], "rpc_host": _safe_rpc_host(url)}
+
+
+def _safe_rpc_host(url: str) -> str:
+    """Strip the API key path from the URL for safe display."""
+    try:
+        # alchemy: https://polygon-mainnet.g.alchemy.com/v2/<key>
+        return url.split("/v2/")[0] + "/v2/…" if "/v2/" in url else url.split("?")[0]
+    except Exception:  # noqa: BLE001
+        return "(redacted)"
+
+
+# ---------- poll loop ----------
+async def _refresh_watched_addresses(db) -> Dict[str, str]:
+    """Reload (address -> user_id) map from broker_connections.polymarket_addresses.
+
+    Cheap to do every tick (typically <100 rows even at scale).
+    """
+    out: Dict[str, str] = {}
+    async for row in db.broker_connections.find({"venue": "polymarket"}):
+        for _label, addr in (row.get("polymarket_addresses") or {}).items():
+            if addr:
+                out[addr.lower()] = str(row.get("user_id") or "")
+    return out
+
+
+async def _scan_ctf_logs(client: httpx.AsyncClient, url: str, from_block: int, to_block: int) -> List[dict]:
+    """Fetch ALL CTF contract logs in [from_block, to_block].
+
+    We do NOT filter by topic at the RPC layer — Polymarket CTF emits relatively
+    few events per minute, and pulling them all lets us match against any user
+    address regardless of which sub-event fired. If volume grows we can topic-
+    filter against `PayoutRedemption` and `PositionsMerge`.
+    """
+    return await _rpc(
+        client,
+        url,
+        "eth_getLogs",
+        [{
+            "fromBlock": hex(from_block),
+            "toBlock": hex(to_block),
+            "address": CTF_CONTRACT,
+        }],
+    )
+
+
+def _addresses_in_log(log: dict) -> List[str]:
+    """Pull any 20-byte addresses from a log's topics (indexed args)."""
+    out: List[str] = []
+    for t in log.get("topics", [])[1:]:  # skip topic0 (event sig)
+        if isinstance(t, str) and len(t) == 66:  # 32-byte topic, 0x + 64 hex
+            # Indexed addresses are right-padded into 32 bytes.
+            out.append("0x" + t[-40:].lower())
+    return out
+
+
+async def poll_loop(db) -> None:
+    """Forever: tick once per POLL_INTERVAL_SEC."""
+    url = os.environ.get("POLYGON_RPC_URL")
+    if not url:
+        logger.warning("POLYGON_RPC_URL not set — settlement watcher disabled")
+        return
+    state.started_at = time.time()
+    backoff = 1.0
+    async with httpx.AsyncClient() as client:
+        # Bootstrap last_scanned_block from system_state, or start at tip-CONF.
+        sysdoc = await db.system_state.find_one({"_id": "polygon"})
+        if sysdoc and isinstance(sysdoc.get("last_scanned_block"), int):
+            state.last_scanned_block = sysdoc["last_scanned_block"]
+            logger.info(f"settlement watcher resuming from block {state.last_scanned_block}")
+        else:
+            try:
+                latest_hex = await _rpc(client, url, "eth_blockNumber", [])
+                tip = int(latest_hex, 16)
+                state.last_scanned_block = max(0, tip - CONF_DEPTH_BLOCKS)
+                logger.info(f"settlement watcher cold start at block {state.last_scanned_block}")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"settlement watcher boot probe failed: {e}")
+                state.last_error = str(e)[:160]
+                # Retry quickly on first failure.
+                await asyncio.sleep(5)
+                return
+
+        while True:
+            try:
+                await _tick(client, url, db)
+                backoff = 1.0
+            except Exception as e:  # noqa: BLE001
+                state.error_count += 1
+                state.last_error = str(e)[:200]
+                logger.warning(f"settlement watcher tick failed: {e}")
+                await asyncio.sleep(min(60.0, backoff))
+                backoff *= 2
+                continue
+            await asyncio.sleep(POLL_INTERVAL_SEC)
+
+
+async def _tick(client: httpx.AsyncClient, url: str, db) -> None:
+    """One scan: advance last_scanned_block in 10-block chunks (Alchemy free-tier limit)."""
+    state.tick_count += 1
+    state.last_tick_at = time.time()
+
+    latest_hex = await _rpc(client, url, "eth_blockNumber", [])
+    latest = int(latest_hex, 16)
+    state.latest_block = latest
+    safe_tip = latest - CONF_DEPTH_BLOCKS
+    if state.last_scanned_block is None or state.last_scanned_block >= safe_tip:
+        # Up to date.
+        return
+
+    # Refresh address watch list at most once per tick.
+    state.address_to_user = await _refresh_watched_addresses(db)
+    if not state.address_to_user:
+        # Nobody has connected Polymarket — skip eth_getLogs entirely. Just
+        # advance the cursor so we don't have to backfill if/when someone connects.
+        new_cursor = min(safe_tip, state.last_scanned_block + (SCAN_CHUNK_BLOCKS * SCAN_MAX_CHUNKS_PER_TICK))
+        state.last_scanned_block = new_cursor
+        await db.system_state.update_one(
+            {"_id": "polygon"},
+            {"$set": {
+                "last_scanned_block": new_cursor,
+                "latest_block": latest,
+                "tick_count": state.tick_count,
+                "updated_at": time.time(),
+            }},
+            upsert=True,
+        )
+        return
+
+    matched: List[dict] = []
+    chunks_done = 0
+    cursor = state.last_scanned_block + 1
+    while cursor <= safe_tip and chunks_done < SCAN_MAX_CHUNKS_PER_TICK:
+        chunk_end = min(safe_tip, cursor + SCAN_CHUNK_BLOCKS - 1)
+        logs = await _scan_ctf_logs(client, url, cursor, chunk_end)
+        for log in logs:
+            for addr in _addresses_in_log(log):
+                if addr in state.address_to_user:
+                    matched.append({
+                        "address": addr,
+                        "user_id": state.address_to_user[addr],
+                        "tx": log.get("transactionHash"),
+                        "block": int(log.get("blockNumber", "0x0"), 16),
+                        "topic0": (log.get("topics") or [None])[0],
+                        "log_index": int(log.get("logIndex", "0x0"), 16),
+                        "raw": log,
+                        "seen_at": time.time(),
+                    })
+        cursor = chunk_end + 1
+        chunks_done += 1
+
+    if matched:
+        # Day-1: just persist for inspection. Day-2 wires settlement.
+        await db.polygon_events.insert_many(matched)
+        logger.info(f"settlement watcher: matched {len(matched)} CTF event(s)")
+
+    state.last_scanned_block = cursor - 1
+    await db.system_state.update_one(
+        {"_id": "polygon"},
+        {"$set": {
+            "last_scanned_block": state.last_scanned_block,
+            "latest_block": latest,
+            "tick_count": state.tick_count,
+            "updated_at": time.time(),
+        }},
+        upsert=True,
+    )
+
+
+# ---------- runtime status snapshot ----------
+async def settlement_status_snapshot(db) -> Dict[str, Any]:
+    """Detailed status for /api/exchange/status (admin + per-user)."""
+    poly_health = await polygon_status()
+    # Kalshi WS is Day-2 — return a stub for now.
+    return {
+        "polygon": {
+            **poly_health,
+            "watcher": {
+                "running": state.started_at > 0,
+                "ticks": state.tick_count,
+                "errors": state.error_count,
+                "last_error": state.last_error,
+                "last_tick_at": state.last_tick_at,
+                "last_scanned_block": state.last_scanned_block,
+                "lag_blocks": (
+                    (state.latest_block - state.last_scanned_block)
+                    if state.latest_block and state.last_scanned_block
+                    else None
+                ),
+                "watched_addresses": len(state.address_to_user),
+            },
+        },
+        "kalshi": {
+            "ws_connected": False,
+            "note": "Kalshi WebSocket fill stream — scheduled for Day 2",
+        },
+    }

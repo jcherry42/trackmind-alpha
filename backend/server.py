@@ -52,6 +52,11 @@ from broker import (
 from crypto import encrypt_payload, fingerprint_for
 from push import push_to_user as _push_to_user_async, DEFAULT_NOTIFY_PREFS
 from live_market import LIVE_INGEST_ENABLED, ingest_forever
+from exchange_settlement import (
+    poll_loop as _polygon_poll_loop,
+    settlement_status_snapshot,
+    derive_polymarket_addresses,
+)
 from state import (
     RateLimit,
     rl_login as _rl_login,
@@ -1451,6 +1456,40 @@ async def me_quota(user: dict = Depends(get_current_user)):
     return await _current_llm_quota_snapshot(user)
 
 
+@api.get("/exchange/status")
+async def exchange_status(user: dict = Depends(get_current_user)):
+    """Real-money settlement infrastructure status.
+
+    Surfaces:
+      - Polygon RPC connectivity + chain id + latest block
+      - Settlement watcher liveness (running, tick count, lag, errors)
+      - Kalshi WS connectivity (Day 2 — currently stubbed)
+      - Per-user data: derived Polymarket EOA, recent matched events
+    """
+    snapshot = await settlement_status_snapshot(db)
+    # Per-user enrichment.
+    me_addr = await db.broker_connections.find_one(
+        {"user_id": str(user["_id"]), "venue": "polymarket"},
+        {"polymarket_addresses": 1, "_id": 0},
+    )
+    eoa = (me_addr or {}).get("polymarket_addresses", {}).get("eoa") if me_addr else None
+    recent = []
+    if eoa:
+        cursor = (
+            db.polygon_events
+            .find({"address": eoa}, {"_id": 0, "raw": 0})
+            .sort("block", -1)
+            .limit(5)
+        )
+        recent = [r async for r in cursor]
+    snapshot["me"] = {
+        "polymarket_eoa": eoa,
+        "recent_events_count": len(recent),
+        "recent_events": recent,
+    }
+    return snapshot
+
+
 @api.get("/brokers/status")
 async def brokers_status(user: dict = Depends(get_current_user)):
     """Report which live brokers are usable for THIS user.
@@ -1574,15 +1613,23 @@ async def upsert_broker_connection(payload: BrokerConnIn, user: dict = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
     fp = fingerprint_for(venue, creds)
     now = datetime.now(timezone.utc)
+    set_doc: Dict[str, Any] = {
+        "encrypted_payload": encrypted,
+        "fingerprint": fp,
+        "status": "untested",
+        "updated_at": now,
+    }
+    # For Polymarket: derive + store the user's public EOA address so the
+    # Polygon settlement watcher can match on-chain events back to this user
+    # WITHOUT ever needing to re-decrypt the private key.
+    if venue == "polymarket":
+        addrs = derive_polymarket_addresses(creds.get("private_key", ""))
+        if addrs:
+            set_doc["polymarket_addresses"] = addrs
     await db.broker_connections.update_one(
         {"user_id": str(user["_id"]), "venue": venue},
         {
-            "$set": {
-                "encrypted_payload": encrypted,
-                "fingerprint": fp,
-                "status": "untested",
-                "updated_at": now,
-            },
+            "$set": set_doc,
             "$setOnInsert": {
                 "user_id": str(user["_id"]),
                 "venue": venue,
@@ -1869,6 +1916,14 @@ async def on_startup():
     if LIVE_INGEST_ENABLED:
         asyncio.create_task(ingest_forever())
         logger.info("live ingest task scheduled")
+
+    # Polygon settlement watcher — only starts if POLYGON_RPC_URL is set.
+    # No-ops gracefully (logs a warning + returns) if the env var is missing.
+    if os.environ.get("POLYGON_RPC_URL"):
+        asyncio.create_task(_polygon_poll_loop(db))
+        logger.info("polygon settlement watcher scheduled")
+    else:
+        logger.info("POLYGON_RPC_URL not set — polygon settlement watcher disabled")
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trackmind.io")
