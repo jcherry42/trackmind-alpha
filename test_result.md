@@ -750,6 +750,56 @@ frontend:
     needs_retesting: true
     status_history:
       - working: "NA"
+  - task: "Day 2 — Polymarket CTF event decoder + settlement matching + live-trade safety cap"
+    implemented: true
+    working: true
+    file: "backend/exchange_settlement.py, backend/server.py, backend_test.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          1) Real CTF event topic hashes (replaced Day 1 placeholders):
+             PayoutRedemption: 0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d
+             PositionsMerge:   0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca
+             PositionSplit:    0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298
+             ConditionResolution: 0xb44d84d3289691f71497564b85d4233648d9dbae8cbdbb4329f301c3a0185894
+             Verified against a real on-chain PayoutRedemption log fetched from Alchemy.
+
+          2) decode_ctf_event(log) — extracts event name, redeemer address,
+             collateral token (verified: 0x2791bca1f2de4661ed88a30c99a7a9449aa84174 = USDC.e),
+             condition_id (from data for PayoutRedemption, from topic[3] for Merge/Split),
+             payout_wei + payout_usdc (6 decimals), index_sets.
+
+          3) _settle_polymarket_position(db, event, user_id) — atomic findOneAndUpdate
+             guarded on status:"open" so duplicate event deliveries (reorgs, double-tick)
+             can't double-settle. Computes realized = payout - entry*contracts - fees,
+             credits bankroll + realized_pnl_today via $inc. Bridges str user_id
+             (positions) to ObjectId (users).
+
+          4) _tick now decodes every matched event, persists rich rows to db.polygon_events
+             with {event, condition_id, payout_usdc, tx, block, log_index}, and runs the
+             settler on PayoutRedemption events. Multiple settlements per tick allowed.
+
+          5) Positions now capture polymarket_condition_id (lower-cased) AND kalshi_ticker
+             at order time, fed off the signal dict — empty for paper trades (no match
+             possible), populated for real Polymarket orders so on-chain payouts find their
+             open position.
+
+          6) Live-trade safety cap in approve_trade:
+             - Hard $ ceiling on live-mode notional/day (default MAX_DAILY_LIVE_NOTIONAL=$50).
+             - Gates ONLY when user.live_mode=true AND live_broker in {polymarket, kalshi}.
+             - Paper trades unaffected (test `live_trade_safety_cap_paper_unaffected` confirms).
+             - Tracks via user.live_notional_today + live_notional_today_date (UTC-day-keyed).
+
+          7) New backend test t_live_trade_safety_cap verifies paper trades are NOT caught
+             by the cap. 28/28 backend tests pass; lint clean.
+
+          Day 3 next: Kalshi WebSocket fill stream, /api/system/preflight endpoint, mobile
+          push notifications fix (expo-notifications web no-op), eas.json prod profile.
+
   - task: "Day 1 — Polygon settlement watcher (Task A foundation)"
     implemented: true
     working: true

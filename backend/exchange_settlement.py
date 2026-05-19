@@ -23,6 +23,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -35,11 +36,19 @@ logger = logging.getLogger("trackmind.settlement")
 # Polymarket's CTF (Conditional Tokens Framework) on Polygon.
 CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-# Event topic0 hashes (keccak256 of the event signature).
-TOPIC_PAYOUT_REDEMPTION = "0xf2cdb4c7d4e1c61b6a3a4f9e9b0b8f4f7e8f0e7d6c5b4a3928171605040302"
-TOPIC_POSITIONS_MERGE = "0x6c81e15c5c9d1f0c1e4cab8e2f2fc6e15b4e6d4b6f5a4b3a2a1b0c0d0e0f1011"
-# NOTE: the topic0 hashes above are placeholders — we read them dynamically from
-# the contract ABI at startup (see `_resolve_topics()`).
+# Event topic0 hashes — keccak256 of the canonical event signature.
+# These are the Gnosis Conditional Tokens events that Polymarket actually emits.
+TOPIC_PAYOUT_REDEMPTION = "0x2682012a4a4f1973119f1c9b90745d1bd91fa2bab387344f044cb3586864d18d"
+TOPIC_POSITIONS_MERGE = "0x6f13ca62553fcc2bcd2372180a43949c1e4cebba603901ede2f4e14f36b282ca"
+TOPIC_POSITION_SPLIT = "0x2e6bb91f8cbcda0c93623c54d0403a43514fabc40084ec96b6d5379a74786298"
+TOPIC_CONDITION_RESOLUTION = "0xb44d84d3289691f71497564b85d4233648d9dbae8cbdbb4329f301c3a0185894"
+
+TOPIC_NAMES = {
+    TOPIC_PAYOUT_REDEMPTION: "PayoutRedemption",
+    TOPIC_POSITIONS_MERGE: "PositionsMerge",
+    TOPIC_POSITION_SPLIT: "PositionSplit",
+    TOPIC_CONDITION_RESOLUTION: "ConditionResolution",
+}
 
 # Polygon chain id.
 POLYGON_CHAIN_ID = 137
@@ -194,6 +203,127 @@ def _addresses_in_log(log: dict) -> List[str]:
     return out
 
 
+def decode_ctf_event(log: dict) -> Dict[str, Any]:
+    """Decode a CTF event log into a dict of named fields.
+
+    Returns at minimum: {event, address, condition_id}. For PayoutRedemption it
+    also returns: {payout_wei, payout_usdc, index_sets}.
+    All other events return raw fields only. Unknown topic0 → {event: "unknown"}.
+    """
+    topics = log.get("topics") or []
+    if not topics:
+        return {"event": "unknown"}
+    topic0 = topics[0]
+    name = TOPIC_NAMES.get(topic0, "unknown")
+    out: Dict[str, Any] = {"event": name, "topic0": topic0}
+    # All four CTF events we track have this indexed layout:
+    #   topic[1] = address (redeemer / stakeholder)
+    #   topic[2] = collateralToken address (indexed)
+    #   topic[3] = parentCollectionId (PayoutRedemption) OR conditionId (Merge/Split)
+    # For PayoutRedemption: conditionId is in `data` (non-indexed!), and parentCollectionId is topic[3].
+    if len(topics) > 1 and isinstance(topics[1], str) and len(topics[1]) == 66:
+        out["address"] = "0x" + topics[1][-40:].lower()
+    if len(topics) > 2 and isinstance(topics[2], str) and len(topics[2]) == 66:
+        out["collateral_token"] = "0x" + topics[2][-40:].lower()
+    if len(topics) > 3:
+        # For Merge/Split, topic[3] is the conditionId directly.
+        # For PayoutRedemption, topic[3] is parentCollectionId — conditionId lives in data.
+        if name in ("PositionsMerge", "PositionSplit"):
+            out["condition_id"] = topics[3]
+        else:
+            out["parent_collection_id"] = topics[3]
+
+    data_hex = log.get("data", "0x")
+    data_bytes = bytes.fromhex(data_hex[2:]) if data_hex.startswith("0x") and len(data_hex) > 2 else b""
+
+    if name == "PayoutRedemption":
+        # data layout (ABI-encoded, big-endian 32-byte words):
+        #   word 0: conditionId (bytes32)
+        #   word 1: offset to indexSets[] (uint256, typically 0x60)
+        #   word 2: payout (uint256, in collateral wei)
+        #   word 3: indexSets length (uint256)
+        #   word 4..: indexSets[i] values
+        if len(data_bytes) >= 96:
+            out["condition_id"] = "0x" + data_bytes[0:32].hex()
+            payout_wei = int.from_bytes(data_bytes[64:96], "big")
+            out["payout_wei"] = payout_wei
+            # USDC.e on Polygon has 6 decimals.
+            out["payout_usdc"] = round(payout_wei / 1_000_000, 6)
+        if len(data_bytes) >= 128:
+            n = int.from_bytes(data_bytes[96:128], "big")
+            out["index_sets"] = [
+                int.from_bytes(data_bytes[128 + i * 32: 160 + i * 32], "big")
+                for i in range(min(n, 16))   # safety bound
+            ]
+    elif name in ("PositionsMerge", "PositionSplit"):
+        # data: indexSets[] + amount (uint256)
+        if len(data_bytes) >= 64:
+            n = int.from_bytes(data_bytes[32:64], "big")
+            tail_off = 64 + n * 32
+            if len(data_bytes) >= tail_off + 32:
+                out["amount_wei"] = int.from_bytes(data_bytes[tail_off:tail_off + 32], "big")
+
+    return out
+
+
+async def _settle_polymarket_position(db, event: Dict[str, Any], user_id: str) -> Optional[dict]:
+    """For a PayoutRedemption event, settle any matching open position.
+
+    Match key: positions.polymarket_condition_id == event.condition_id (case-insensitive)
+    AND positions.user_id == user_id AND positions.status == "open".
+
+    Uses an atomic findOneAndUpdate({status:"open"}) so a duplicate event delivery
+    (re-orgs, double-tick) can't double-settle. Returns the settled position dict
+    or None when nothing matched.
+    """
+    cond = (event.get("condition_id") or "").lower()
+    payout_usdc = float(event.get("payout_usdc") or 0.0)
+    if not cond:
+        return None
+    open_pos = await db.positions.find_one_and_update(
+        {
+            "user_id": user_id,
+            "polymarket_condition_id": cond,
+            "status": "open",
+        },
+        {"$set": {
+            "status": "closed",
+            "exit_price": round(min(1.0, payout_usdc / max(0.0001, float(0))) if False else min(1.0, payout_usdc), 4),
+            "settle_source": "polygon_ctf",
+            "settle_tx": event.get("tx"),
+            "settle_block": event.get("block"),
+            "closed_at": datetime.now(timezone.utc),
+        }},
+    )
+    if not open_pos:
+        return None
+    contracts = float(open_pos.get("contracts") or 0.0)
+    entry_price = float(open_pos.get("entry_price") or 0.0)
+    fees = float(open_pos.get("fees") or 0.0)
+    realized = round(payout_usdc - entry_price * contracts - fees, 2)
+    # exit_price should be payout-per-contract, clamped [0, 1] for prediction markets.
+    exit_price_per_contract = round(min(1.0, max(0.0, payout_usdc / max(0.01, contracts))), 4)
+    await db.positions.update_one(
+        {"_id": open_pos["_id"]},
+        {"$set": {"realized_pnl": realized, "exit_price": exit_price_per_contract}},
+    )
+    # `user_id` in positions is a string; in users it's an ObjectId — bridge them.
+    from bson import ObjectId
+    try:
+        user_oid = ObjectId(user_id) if isinstance(user_id, str) and len(user_id) == 24 else user_id
+    except Exception:  # noqa: BLE001
+        user_oid = user_id
+    await db.users.update_one(
+        {"_id": user_oid},
+        {"$inc": {"bankroll": realized, "realized_pnl_today": realized}},
+    )
+    logger.info(
+        f"settlement: position {open_pos['_id']} closed via on-chain PayoutRedemption "
+        f"payout=${payout_usdc:.2f} pnl=${realized:.2f}"
+    )
+    return {**open_pos, "realized_pnl": realized, "payout_usdc": payout_usdc, "exit_price": exit_price_per_contract}
+
+
 async def poll_loop(db) -> None:
     """Forever: tick once per POLL_INTERVAL_SEC."""
     url = os.environ.get("POLYGON_RPC_URL")
@@ -276,12 +406,16 @@ async def _tick(client: httpx.AsyncClient, url: str, db) -> None:
         for log in logs:
             for addr in _addresses_in_log(log):
                 if addr in state.address_to_user:
+                    decoded = decode_ctf_event(log)
                     matched.append({
                         "address": addr,
                         "user_id": state.address_to_user[addr],
                         "tx": log.get("transactionHash"),
                         "block": int(log.get("blockNumber", "0x0"), 16),
                         "topic0": (log.get("topics") or [None])[0],
+                        "event": decoded.get("event", "unknown"),
+                        "condition_id": decoded.get("condition_id"),
+                        "payout_usdc": decoded.get("payout_usdc"),
                         "log_index": int(log.get("logIndex", "0x0"), 16),
                         "raw": log,
                         "seen_at": time.time(),
@@ -289,10 +423,26 @@ async def _tick(client: httpx.AsyncClient, url: str, db) -> None:
         cursor = chunk_end + 1
         chunks_done += 1
 
+    settled: List[dict] = []
     if matched:
-        # Day-1: just persist for inspection. Day-2 wires settlement.
-        await db.polygon_events.insert_many(matched)
-        logger.info(f"settlement watcher: matched {len(matched)} CTF event(s)")
+        # Persist decoded events for inspection/audit.
+        await db.polygon_events.insert_many([m.copy() for m in matched])
+        # Run settlement on PayoutRedemption events. Idempotent via the open-status guard.
+        for m in matched:
+            if m.get("event") != "PayoutRedemption":
+                continue
+            res = await _settle_polymarket_position(db, {
+                "condition_id": m.get("condition_id"),
+                "payout_usdc": m.get("payout_usdc"),
+                "tx": m.get("tx"),
+                "block": m.get("block"),
+            }, m["user_id"])
+            if res:
+                settled.append(res)
+        logger.info(
+            f"settlement watcher: matched {len(matched)} CTF event(s); "
+            f"settled {len(settled)} position(s)"
+        )
 
     state.last_scanned_block = cursor - 1
     await db.system_state.update_one(

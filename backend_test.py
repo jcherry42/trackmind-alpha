@@ -570,6 +570,38 @@ def _pick_signal_id(tok: str) -> str | None:
     return None
 
 
+def t_live_trade_safety_cap():
+    """Day 2: MAX_DAILY_LIVE_NOTIONAL should NOT trigger for paper trades.
+
+    A normal paper trade should succeed even if it exceeds the $50 default cap,
+    because the cap is gated on user.live_mode=true AND live_broker in {polymarket, kalshi}.
+    The admin user is paper-only so this should pass freely.
+    """
+    sid = _pick_signal_id(admin_token)
+    if not sid:
+        record("live_trade_safety_cap_paper_unaffected", False, "no signals")
+        return
+    r = requests.post(
+        f"{API}/trade/approve",
+        headers={**auth_hdr(admin_token), "Idempotency-Key": uuid.uuid4().hex},
+        json={"signal_id": sid},
+        timeout=20,
+    )
+    ok = r.status_code in (200, 400)  # 400 if circuit/cap, but NOT 400 with live-trade-cap message
+    detail = ""
+    try:
+        detail = r.json().get("detail", "") if r.status_code == 400 else ""
+    except Exception:
+        pass
+    # The specific "Live-trade daily cap" message MUST NOT appear for paper trades.
+    cap_msg = "live-trade daily cap" in detail.lower()
+    record(
+        "live_trade_safety_cap_paper_unaffected",
+        ok and not cap_msg,
+        f"http {r.status_code}, contains live-trade-cap msg={cap_msg}",
+    )
+
+
 def t_per_trade_cap_blocks():
     # Reuse user_token (default bankroll $10k, max_trade_pct=0.02 → $200 cap).
     tok = user_token
@@ -681,6 +713,7 @@ def main() -> int:
     t_risk_limits_get()
     t_risk_limits_patch_out_of_bounds()
     t_per_trade_cap_blocks()
+    t_live_trade_safety_cap()
     t_circuit_flag_false_when_no_loss()
     t_delete_nonexistent()
     t_delete_bad_venue()

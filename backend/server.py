@@ -971,6 +971,27 @@ async def approve_trade(
             )
         notional = capped
 
+        # Live-trade safety cap (Day 2 hardening). Independent of the per-trade %
+        # cap: a hard $ ceiling on live-mode notional to prevent runaway spend
+        # while live trading is still being burned in. Paper trades are unaffected.
+        if user.get("live_mode") and (user.get("live_broker") or "").lower() in ("polymarket", "kalshi"):
+            try:
+                live_cap = float(os.environ.get("MAX_DAILY_LIVE_NOTIONAL", "50"))
+            except ValueError:
+                live_cap = 50.0
+            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            spent_today = float(user.get("live_notional_today", 0.0)) if user.get("live_notional_today_date") == today_key else 0.0
+            if spent_today + notional > live_cap:
+                # Refund the bankroll debit that has NOT yet happened — we haven't
+                # called _atomic_bankroll_debit yet.
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Live-trade daily cap reached: ${spent_today:.2f} + ${notional:.2f} > ${live_cap:.2f}. "
+                        f"Raise MAX_DAILY_LIVE_NOTIONAL env to lift this."
+                    ),
+                )
+
         # Atomically debit bankroll BEFORE placing order; if debit fails, refuse.
         ok = await _atomic_bankroll_debit(user["_id"], notional)
         if not ok:
@@ -1005,8 +1026,29 @@ async def approve_trade(
             "broker": fill["broker"],
             "fill_id": fill["id"],
             "signal_id": payload.signal_id,
+            # Phase A2 (Day 2): condition_id captured at order time so the
+            # Polygon settlement watcher can match real on-chain payouts back to
+            # this position. None for paper trades; populated for Polymarket live.
+            "polymarket_condition_id": (sig.get("polymarket_condition_id") or "").lower() or None,
+            "kalshi_ticker": sig.get("kalshi_ticker"),
         }
         res = await db.positions.insert_one(pos_doc)
+        # Track live-mode daily notional for the per-day safety cap.
+        if fill.get("broker") in ("polymarket", "kalshi"):
+            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            await db.users.update_one(
+                {"_id": user["_id"]},
+                [{"$set": {
+                    "live_notional_today_date": today_key,
+                    "live_notional_today": {
+                        "$cond": [
+                            {"$eq": ["$live_notional_today_date", today_key]},
+                            {"$add": [{"$ifNull": ["$live_notional_today", 0]}, fill["notional"]]},
+                            fill["notional"],
+                        ]
+                    },
+                }}],
+            )
         # Apply difference if broker sized slightly differently than the debited amount.
         if abs(fill["notional"] - notional) > 0.005:
             diff = notional - fill["notional"]  # positive = refund
