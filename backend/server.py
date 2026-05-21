@@ -1057,6 +1057,14 @@ async def approve_trade(
                     },
                 }}],
             )
+            # P2 observability counter
+            try:
+                from observability import live_orders_placed_total
+                live_orders_placed_total.labels(
+                    venue=fill["broker"], side=(sig.get("side") or "yes").lower()
+                ).inc()
+            except Exception:  # noqa: BLE001
+                pass
         # Apply difference if broker sized slightly differently than the debited amount.
         if abs(fill["notional"] - notional) > 0.005:
             diff = notional - fill["notional"]  # positive = refund
@@ -1155,6 +1163,15 @@ async def auto_deploy(
             res = await db.positions.insert_one(pos_doc)
             pos_doc["_id"] = res.inserted_id
             deployed.append(_serialize_position(pos_doc))
+            # P2 observability — count live orders placed via auto-deploy.
+            if fill.get("broker") in ("polymarket", "kalshi"):
+                try:
+                    from observability import live_orders_placed_total
+                    live_orders_placed_total.labels(
+                        venue=fill["broker"], side=(order.get("side") or "yes").lower()
+                    ).inc()
+                except Exception:  # noqa: BLE001
+                    pass
         await audit(user_id, "trade.auto_deploy", {"count": len(deployed)})
         response = {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
         # B2 push: notify user when auto-deploy actually placed orders.
@@ -1387,7 +1404,13 @@ async def health():
 # ---------- admin observability ----------
 @api.get("/admin/metrics")
 async def metrics(user: dict = Depends(require_admin)):
-    """Return lightweight ops metrics (LLM usage, cache hit rate, engine counts)."""
+    """Return lightweight ops metrics (LLM usage, cache hit rate, engine counts).
+
+    Phase-2 P2 additions:
+      - `live`: today's & lifetime live-order / settlement counts, today's notional + PnL.
+      - `pnl_7d`: per-day realized PnL for the last 7 UTC days (sum across all users).
+      - `exchanges`: settlement watcher / Kalshi WS health snapshot.
+    """
     async with _engine_cache_lock:
         total_signals = len(_engine_cache["signals"])
         updated_at = _engine_cache["updated_at"]
@@ -1401,6 +1424,78 @@ async def metrics(user: dict = Depends(require_admin)):
     positions_open = await db.positions.count_documents({"status": "open"})
     positions_total = await db.positions.count_documents({})
     revoked_tokens = await db.revoked_tokens.count_documents({})
+
+    # ----- Live trading stats (today + lifetime) -----
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    start_of_today = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    live_orders_today = await db.positions.count_documents({
+        "broker": {"$in": ["polymarket", "kalshi"]},
+        "opened_at": {"$gte": start_of_today},
+    })
+    live_orders_lifetime = await db.positions.count_documents({
+        "broker": {"$in": ["polymarket", "kalshi"]},
+    })
+    fills_today_kalshi = await db.kalshi_fills.count_documents({
+        "seen_at": {"$gte": start_of_today.timestamp()},
+    }) if "kalshi_fills" in await db.list_collection_names() else 0
+    settlements_today = await db.positions.count_documents({
+        "settle_source": "polygon_ctf",
+        "closed_at": {"$gte": start_of_today},
+    })
+    # Aggregate today's live notional + realized PnL from per-user fields.
+    notional_today_agg = await db.users.aggregate([
+        {"$match": {"live_notional_today_date": today_key}},
+        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$live_notional_today", 0]}}}},
+    ]).to_list(length=1)
+    live_notional_today_usd = float(notional_today_agg[0]["total"]) if notional_today_agg else 0.0
+    pnl_today_agg = await db.users.aggregate([
+        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$realized_pnl_today", 0]}}}},
+    ]).to_list(length=1)
+    realized_pnl_today_usd = float(pnl_today_agg[0]["total"]) if pnl_today_agg else 0.0
+
+    # Refresh gauges so /metrics (Prometheus) is always fresh.
+    try:
+        from observability import (
+            realized_pnl_today_usd_gauge as _g_pnl,
+            live_notional_today_usd_gauge as _g_not,
+            open_positions_gauge as _g_open,
+        )
+        _g_pnl.set(realized_pnl_today_usd)
+        _g_not.set(live_notional_today_usd)
+        _g_open.set(positions_open)
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ----- 7-day PnL history (closed positions, grouped by UTC date) -----
+    seven_days_ago = start_of_today - timedelta(days=6)
+    pnl_7d_agg = await db.positions.aggregate([
+        {"$match": {"status": "closed", "closed_at": {"$gte": seven_days_ago}}},
+        {"$group": {
+            "_id": {"$dateToString": {"format": "%Y-%m-%d", "date": "$closed_at"}},
+            "pnl": {"$sum": {"$ifNull": ["$realized_pnl", 0]}},
+            "n": {"$sum": 1},
+        }},
+        {"$sort": {"_id": 1}},
+    ]).to_list(length=7)
+    pnl_7d_map = {row["_id"]: {"pnl": round(float(row["pnl"]), 2), "n": int(row["n"])} for row in pnl_7d_agg}
+    pnl_7d = []
+    for i in range(7):
+        day = (start_of_today - timedelta(days=6 - i)).strftime("%Y-%m-%d")
+        pnl_7d.append({"date": day, **pnl_7d_map.get(day, {"pnl": 0.0, "n": 0})})
+
+    # ----- Exchange / settlement watcher health -----
+    exchanges = {}
+    try:
+        from exchange_settlement import polygon_status_snapshot
+        exchanges["polygon"] = polygon_status_snapshot()
+    except Exception:  # noqa: BLE001
+        exchanges["polygon"] = {"available": False}
+    try:
+        from kalshi_ws import kalshi_status_snapshot
+        exchanges["kalshi_ws"] = kalshi_status_snapshot()
+    except Exception:  # noqa: BLE001
+        exchanges["kalshi_ws"] = {"available": False}
+
     return {
         "llm": {
             "calls": total_calls,
@@ -1420,6 +1515,16 @@ async def metrics(user: dict = Depends(require_admin)):
             "positions_total": positions_total,
             "revoked_tokens": revoked_tokens,
         },
+        "live": {
+            "orders_today": live_orders_today,
+            "orders_lifetime": live_orders_lifetime,
+            "fills_today_kalshi": fills_today_kalshi,
+            "settlements_today": settlements_today,
+            "notional_today_usd": round(live_notional_today_usd, 2),
+            "realized_pnl_today_usd": round(realized_pnl_today_usd, 2),
+        },
+        "pnl_7d": pnl_7d,
+        "exchanges": exchanges,
         "ts": time.time(),
     }
 

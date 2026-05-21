@@ -106,6 +106,43 @@ active_users_gauge = Gauge("tm_active_users", "Distinct users seen in the last 5
 open_positions_gauge = Gauge("tm_open_positions", "Currently open positions")
 engine_signals_gauge = Gauge("tm_engine_signals", "Signals currently cached", ["engine"])
 
+# ----- Live-trading & exchange health metrics (P2 observability) -----
+# Counter: every successful live order placed at a real venue (paper trades excluded).
+live_orders_placed_total = Counter(
+    "tm_live_orders_placed_total",
+    "Live (real-money) orders successfully placed",
+    ["venue", "side"],
+)
+# Counter: every fill we observe — either from the Kalshi WS fill channel, or from
+# a matched Polymarket PayoutRedemption event on Polygon. action ∈ {buy, sell, settle}.
+live_fills_received_total = Counter(
+    "tm_live_fills_received_total",
+    "Live fills observed from broker WS / on-chain settlement",
+    ["venue", "action"],
+)
+# Counter: WS reconnect attempts (excluding the initial connect). venue=kalshi for now.
+ws_reconnects_total = Counter(
+    "tm_ws_reconnects_total",
+    "WebSocket reconnect attempts",
+    ["venue"],
+)
+# Counter: RPC errors hitting the chain providers (Alchemy, etc.).
+rpc_errors_total = Counter(
+    "tm_rpc_errors_total",
+    "JSON-RPC errors from the upstream chain provider",
+    ["provider"],
+)
+# Gauge: today's realized PnL across all users (USD). Refreshed on each /admin/metrics call.
+realized_pnl_today_usd_gauge = Gauge(
+    "tm_realized_pnl_today_usd",
+    "Sum of realized PnL across all users for the current UTC day",
+)
+# Gauge: today's live (real-money) notional placed across all users.
+live_notional_today_usd_gauge = Gauge(
+    "tm_live_notional_today_usd",
+    "Sum of live-mode notional placed across all users for the current UTC day",
+)
+
 
 def new_request_id() -> str:
     """Compact request ID (first 12 hex chars of a uuid4)."""

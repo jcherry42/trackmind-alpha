@@ -85,6 +85,28 @@ class SettlementState:
 state = SettlementState()
 
 
+def polygon_status_snapshot() -> Dict[str, Any]:
+    """Sync snapshot of the Polygon settlement watcher state.
+
+    Cheap to call from any sync handler — no I/O, just reflects in-memory state.
+    Pair this with the async `polygon_status()` if you need a live RPC ping.
+    """
+    age = (time.time() - state.last_tick_at) if state.last_tick_at else None
+    return {
+        "available": True,
+        "started_at": state.started_at,
+        "last_tick_at": state.last_tick_at,
+        "last_tick_age_sec": round(age, 1) if age is not None else None,
+        "tick_count": state.tick_count,
+        "error_count": state.error_count,
+        "last_error": state.last_error,
+        "latest_block": state.latest_block,
+        "last_scanned_block": state.last_scanned_block,
+        "watched_addresses": len(state.address_to_user),
+        "rpc_url_set": bool(os.environ.get("POLYGON_RPC_URL")),
+    }
+
+
 # ---------- key + address derivation ----------
 def derive_polymarket_addresses(private_key: str) -> Dict[str, str]:
     """Return (eoa, proxy) for a Polymarket private key.
@@ -321,6 +343,12 @@ async def _settle_polymarket_position(db, event: Dict[str, Any], user_id: str) -
         f"settlement: position {open_pos['_id']} closed via on-chain PayoutRedemption "
         f"payout=${payout_usdc:.2f} pnl=${realized:.2f}"
     )
+    # P2 observability counter
+    try:
+        from observability import live_fills_received_total
+        live_fills_received_total.labels(venue="polymarket", action="settle").inc()
+    except Exception:  # noqa: BLE001
+        pass
     return {**open_pos, "realized_pnl": realized, "payout_usdc": payout_usdc, "exit_price": exit_price_per_contract}
 
 
@@ -359,6 +387,12 @@ async def poll_loop(db) -> None:
                 state.error_count += 1
                 state.last_error = str(e)[:200]
                 logger.warning(f"settlement watcher tick failed: {e}")
+                # P2 observability counter
+                try:
+                    from observability import rpc_errors_total
+                    rpc_errors_total.labels(provider="alchemy").inc()
+                except Exception:  # noqa: BLE001
+                    pass
                 await asyncio.sleep(min(60.0, backoff))
                 backoff *= 2
                 continue

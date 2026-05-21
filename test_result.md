@@ -555,8 +555,56 @@ agent_communication:
       Updated test_result.md: all 4 Phase 2 backend tasks now
       working: true, needs_retesting: false.
 
+  - agent: "testing"
+    message: |
+      P2 Observability verification PASSED against external EXPO_PUBLIC_BACKEND_URL.
+
+      1) /api/admin/metrics (admin only) — 24/24 shape assertions PASS (script
+         /app/p2_test.py):
+           ✓ Existing keys preserved: llm, engines, db, ts.
+           ✓ live: orders_today, orders_lifetime, fills_today_kalshi, settlements_today
+             (int); notional_today_usd, realized_pnl_today_usd (float). All present + typed.
+           ✓ pnl_7d: list of EXACTLY 7 items; each {date:"YYYY-MM-DD", pnl:float, n:int};
+             sorted oldest→newest; last entry == today UTC (2026-05-21).
+           ✓ exchanges.polygon: available=true, tick_count=int, error_count=int,
+             last_tick_age_sec=float, rpc_url_set=bool, latest_block=87234460 (int, no
+             warm-up retry needed).
+           ✓ exchanges.kalshi_ws: active_streams=int, total_streams=int, streams=list.
+           ✓ Non-admin user → 403 {"detail":"Admin only"}.
+
+      2) /api/metrics (unauth, Prometheus text exposition) — 200 OK.
+           ✓ All 6 NEW metric family names present in body:
+              tm_live_orders_placed_total, tm_live_fills_received_total,
+              tm_ws_reconnects_total, tm_rpc_errors_total,
+              tm_realized_pnl_today_usd, tm_live_notional_today_usd.
+           ✓ Regression: tm_http_requests_total, tm_llm_calls_total,
+             tm_open_positions still present.
+
+      3) pytest regression: backend/tests/test_trackmind.py → 29/30 PASS (baseline 29/29
+         maintained — the suite now has 30 collected tests because TestPhase4Concurrency
+         was added since the prior run). The single failure is TestAuth::test_register_new_user
+         which 429'd with "Rate limit exceeded: 5 per 3600s" — this is the per-IP register
+         rate-limiter doing its job after my P2 verification script burned through the
+         5/hr quota on this ingress IP. NOT a regression; will pass naturally next run on
+         a fresh hour. All Phase 1, Phase 2, Phase 4, and the new P2 tests pass.
+
+      No code changes made. Both P2 observability tasks marked working=true.
+
 phase4:
   - task: "Phase 4 — Atomic claim-first idempotency (race fix)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: false
+        agent: "main"
+        comment: "Initial impl (read-then-write) leaked: 100 concurrent approves with same key produced 30 distinct fills (race condition)."
+      - working: true
+        agent: "main"
+        comment: "Rewritten with findOneAndUpdate+$setOnInsert claim, in-flight wait, abort-on-error. Verified: 40 concurrent approves with identical Idempotency-Key now yield exactly 1 distinct fill_id and 1 position."
     implemented: true
     working: true
     file: "backend/server.py"
@@ -1018,3 +1066,109 @@ frontend:
           UX note (from code only): EDIT pill in Risk Limits card is 10×4px padding — tap
           target is ~24px tall, BELOW the 44pt iOS guideline. Consider increasing paddingVertical
           to 8 or wrapping in a larger hitSlop.
+
+phase_p2_observability:
+  - task: "P2 Observability — new Prometheus counters (live_orders, live_fills, ws_reconnects, rpc_errors)"
+    implemented: true
+    working: true
+    file: "backend/observability.py, backend/server.py, backend/kalshi_ws.py, backend/exchange_settlement.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: |
+          PASS. GET /api/metrics (unauth) returns 200 + Prometheus text exposition.
+          All 6 NEW metric families present in body:
+            ✓ tm_live_orders_placed_total
+            ✓ tm_live_fills_received_total
+            ✓ tm_ws_reconnects_total
+            ✓ tm_rpc_errors_total
+            ✓ tm_realized_pnl_today_usd
+            ✓ tm_live_notional_today_usd
+          Existing families also still present (regression check):
+            ✓ tm_http_requests_total
+            ✓ tm_llm_calls_total
+            ✓ tm_open_positions
+          Verified counter values not asserted (per review brief — would need real
+          WS/RPC events to increment).
+      - working: true
+        agent: "main"
+        comment: |
+          Added 6 new Prometheus metrics in backend/observability.py:
+            • tm_live_orders_placed_total{venue,side}     (Counter)
+            • tm_live_fills_received_total{venue,action}  (Counter)
+            • tm_ws_reconnects_total{venue}               (Counter)
+            • tm_rpc_errors_total{provider}               (Counter)
+            • tm_realized_pnl_today_usd                   (Gauge)
+            • tm_live_notional_today_usd                  (Gauge)
+          Wired in code paths:
+            • server.approve_trade (lines ~1063) + server.auto_deploy (lines ~1175) —
+              live_orders_placed_total.labels(venue=fill.broker, side=...).inc() ONLY on
+              broker ∈ {polymarket, kalshi} (paper trades excluded).
+            • kalshi_ws._handle_fill — live_fills_received_total.labels(venue="kalshi",
+              action=fill.action).inc() per inserted fill row.
+            • kalshi_ws.run loop except: — ws_reconnects_total.labels(venue="kalshi").inc()
+              on every reconnect attempt.
+            • exchange_settlement._settle_polymarket_position — live_fills_received_total
+              .labels(venue="polymarket", action="settle").inc() per matched PayoutRedemption.
+            • exchange_settlement.poll_loop tick failure — rpc_errors_total
+              .labels(provider="alchemy").inc() on RPC exception.
+          Gauges refreshed on every /api/admin/metrics call.
+          Empirical verification:
+            ✓ GET /api/metrics returns all 6 new metric families in Prom text format.
+            ✓ tm_ws_reconnects_total{venue="kalshi"} = 3.0 (from 3 dead PEM streams retrying).
+            ✓ 28/28 backend tests still pass — zero regression.
+            ✓ Lint clean (ruff).
+  - task: "P2 Observability — /api/admin/metrics extended with daily PnL + live counts + exchanges health"
+    implemented: true
+    working: true
+    file: "backend/server.py, backend/exchange_settlement.py"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: |
+          PASS — full shape verification against external EXPO_PUBLIC_BACKEND_URL.
+            ✓ GET /api/admin/metrics (admin token) returns 200; non-admin user returns 403
+              {"detail":"Admin only"}.
+            ✓ Existing keys still present: llm, engines, db, ts.
+            ✓ live block: orders_today=int, orders_lifetime=int, fills_today_kalshi=int,
+              settlements_today=int, notional_today_usd=float, realized_pnl_today_usd=float.
+            ✓ pnl_7d: list length=7; each item={date:"YYYY-MM-DD", pnl:float, n:int};
+              sorted oldest→newest; last entry = today UTC.
+            ✓ exchanges.polygon: available=true, tick_count=int, error_count=int,
+              last_tick_age_sec=float, rpc_url_set=bool, latest_block=int (87234460 — confirmed
+              warm-up succeeded, not null).
+            ✓ exchanges.kalshi_ws: active_streams=int, total_streams=int, streams=list.
+          24/24 P2 verification assertions PASS (script: /app/p2_test.py).
+      - working: true
+        agent: "main"
+        comment: |
+          Extended GET /api/admin/metrics (admin-only) to include three new top-level sections:
+            "live": {
+              orders_today, orders_lifetime, fills_today_kalshi, settlements_today,
+              notional_today_usd, realized_pnl_today_usd
+            }
+            "pnl_7d": [ {date: "YYYY-MM-DD", pnl: float, n: int} × 7 ]
+              — last 7 UTC days of realized PnL aggregated from positions with status="closed".
+              Zero-fills missing days so the chart always renders a continuous strip.
+            "exchanges": {
+              "polygon":   polygon_status_snapshot() — started_at, last_tick_at,
+                           last_tick_age_sec, tick_count, error_count, last_error,
+                           latest_block, last_scanned_block, watched_addresses,
+                           rpc_url_set
+              "kalshi_ws": kalshi_status_snapshot() — ws_url, active_streams,
+                           total_streams, per-user streams[]
+            }
+          New helper exchange_settlement.polygon_status_snapshot() (sync, no I/O) added
+          alongside the existing async polygon_status(). Kalshi snapshot already existed.
+          Empirical verification:
+            ✓ curl /api/admin/metrics (admin token) shape verified — all sections populated.
+            ✓ exchanges.polygon shows latest_block=87234192, tick_count=1, error_count=0.
+            ✓ exchanges.kalshi_ws shows 3 streams with reconnects=1 and last_error visible.
+            ✓ 28/28 backend tests still pass.
+

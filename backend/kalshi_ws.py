@@ -136,6 +136,12 @@ class KalshiWsClient:
                 self.connected = False
                 self.last_error = str(e)[:180]
                 self.reconnect_count += 1
+                # P2 observability counter
+                try:
+                    from observability import ws_reconnects_total
+                    ws_reconnects_total.labels(venue="kalshi").inc()
+                except Exception:  # noqa: BLE001
+                    pass
                 # Distinguish unrecoverable config errors from transient network failures.
                 # If the PEM can't be loaded at all, no amount of reconnecting will fix it —
                 # stop the loop until the user re-saves credentials.
@@ -186,6 +192,12 @@ class KalshiWsClient:
             "raw": body,
             "seen_at": time.time(),
         })
+        # P2 observability counter
+        try:
+            from observability import live_fills_received_total
+            live_fills_received_total.labels(venue="kalshi", action=action).inc()
+        except Exception:  # noqa: BLE001
+            pass
         logger.info(
             f"kalshi_ws[{self.user_id}] fill: {ticker} {action} {side} "
             f"{count}@{price_cents}¢"
