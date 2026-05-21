@@ -362,7 +362,7 @@ const PLACEHOLDER: EngineStatus[] = [
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
-  scroll: { paddingHorizontal: space.lg, paddingBottom: space.xl, gap: space.xl },
+  scroll: { paddingHorizontal: space.lg, paddingBottom: space.xl, gap: space.xl, width: "100%", maxWidth: 760, alignSelf: "center" },
   topBar: {
     flexDirection: "row",
     justifyContent: "space-between",

@@ -195,7 +195,7 @@ const styles = StyleSheet.create({
   title: { ...typo.h2, color: colors.textPrimary },
   tagline: { color: colors.textTertiary, fontSize: 12, marginTop: 2 },
   count: { ...typo.metric, fontSize: 28, color: colors.micro },
-  list: { paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: 80, gap: space.md },
+  list: { paddingHorizontal: space.lg, paddingTop: space.md, paddingBottom: 80, gap: space.md, width: "100%", maxWidth: 760, alignSelf: "center" },
   empty: { color: colors.textTertiary, textAlign: "center", marginTop: space.xxl },
   card: {
     backgroundColor: colors.surface,

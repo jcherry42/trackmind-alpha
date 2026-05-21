@@ -182,7 +182,7 @@ function Stat({
 
 const styles = StyleSheet.create({
   safe: { flex: 1, backgroundColor: colors.bg },
-  scroll: { paddingHorizontal: space.lg, paddingBottom: space.xl, paddingTop: space.md, gap: space.lg },
+  scroll: { paddingHorizontal: space.lg, paddingBottom: space.xl, paddingTop: space.md, gap: space.lg, width: "100%", maxWidth: 760, alignSelf: "center" },
   header: { paddingTop: space.sm },
   title: { ...typo.h2, color: colors.textPrimary },
   heroCard: {

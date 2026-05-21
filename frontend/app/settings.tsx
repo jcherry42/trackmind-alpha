@@ -19,6 +19,7 @@ import { ProgressBar } from "../components/ProgressBar";
 import { useSnackbar } from "../components/Snackbar";
 import { BrokerConnectionModal } from "../components/BrokerConnectionModal";
 import { RiskLimitsModal, type RiskLimits } from "../components/RiskLimitsModal";
+import { ResponsiveContent } from "../components/ResponsiveContent";
 import { colors, radius, space, type as typo } from "../lib/theme";
 import { formatUsd } from "../lib/format";
 
@@ -200,6 +201,7 @@ export default function SettingsScreen() {
       </View>
 
       <ScrollView contentContainerStyle={styles.scroll}>
+        <ResponsiveContent>
         <Card>
           <Text style={styles.metricLabel}>ACCOUNT</Text>
           <Text style={styles.value}>{user?.email}</Text>
@@ -585,6 +587,7 @@ export default function SettingsScreen() {
           TRACKMIND v1.0.0 · Paper Mode
         </Text>
         <View style={{ height: space.xl }} />
+        </ResponsiveContent>
       </ScrollView>
 
       {modalVenue && (

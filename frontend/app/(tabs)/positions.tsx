@@ -170,7 +170,7 @@ const styles = StyleSheet.create({
   countOpen: { ...typo.metric, fontSize: 18, color: colors.positive },
   countClosed: { ...typo.metric, fontSize: 18, color: colors.textTertiary },
   countSep: { color: colors.textMuted },
-  scroll: { paddingHorizontal: space.lg, paddingTop: space.md },
+  scroll: { paddingHorizontal: space.lg, paddingTop: space.md, width: "100%", maxWidth: 760, alignSelf: "center" },
   sectionLabel: {
     ...typo.micro,
     color: colors.textTertiary,

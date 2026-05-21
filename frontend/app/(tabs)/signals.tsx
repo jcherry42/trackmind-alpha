@@ -256,7 +256,7 @@ const styles = StyleSheet.create({
     borderColor: colors.borderSubtle,
   },
   filterText: { fontSize: 11, fontWeight: "600", letterSpacing: 1.2, textTransform: "uppercase" },
-  list: { paddingHorizontal: space.lg, paddingBottom: 80 },
+  list: { paddingHorizontal: space.lg, paddingBottom: 80, width: "100%", maxWidth: 760, alignSelf: "center" },
   empty: { color: colors.textTertiary, textAlign: "center", marginTop: space.xxl },
   row: {
     paddingVertical: space.md,
