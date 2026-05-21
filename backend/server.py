@@ -56,6 +56,14 @@ from exchange_settlement import (
     poll_loop as _polygon_poll_loop,
     settlement_status_snapshot,
     derive_polymarket_addresses,
+    polygon_status,
+)
+from kalshi_ws import (
+    start_all_streams as _kalshi_start_all,
+    restart_user_stream as _kalshi_restart_user,
+    stop_user_stream as _kalshi_stop_user,
+    kalshi_status_snapshot,
+    my_stream_status as _kalshi_my_status,
 )
 from state import (
     RateLimit,
@@ -1528,8 +1536,102 @@ async def exchange_status(user: dict = Depends(get_current_user)):
         "polymarket_eoa": eoa,
         "recent_events_count": len(recent),
         "recent_events": recent,
+        "kalshi_stream": _kalshi_my_status(str(user["_id"])),
     }
+    # Replace the Day-1 Kalshi stub with the real WS state.
+    snapshot["kalshi"] = kalshi_status_snapshot()
     return snapshot
+
+
+# ---------- system preflight ----------
+@api.get("/system/preflight")
+async def system_preflight(user: dict = Depends(get_current_user)):
+    """Single endpoint asserting the app is ready for live trading.
+
+    Returns a list of checks, each with `{key, label, ok, detail}`. The mobile
+    Settings screen surfaces a green/red dot per row. Caller can quickly tell:
+      - Is the encryption master key set?
+      - Is the Polygon RPC reachable?
+      - Has the user connected at least one broker?
+      - For each connected broker, is the credential valid?
+      - Is the Kalshi WS connected (if Kalshi connected)?
+      - Has the user registered a push token?
+    """
+    checks: List[Dict[str, Any]] = []
+
+    # 1. Master key
+    mk = os.environ.get("TRACKMIND_MASTER_KEY", "")
+    checks.append({
+        "key": "master_key",
+        "label": "Encryption master key",
+        "ok": bool(mk) and len(mk) >= 32,
+        "detail": "set" if mk and len(mk) >= 32 else "missing or short",
+    })
+
+    # 2. Polygon RPC reachability
+    poly = await polygon_status()
+    checks.append({
+        "key": "polygon_rpc",
+        "label": "Polygon RPC (Alchemy)",
+        "ok": bool(poly.get("connected")),
+        "detail": (
+            f"block {poly.get('latest_block')} on chain {poly.get('chain_id')}"
+            if poly.get("connected") else poly.get("reason", "unknown")
+        ),
+    })
+
+    # 3. At least one broker connected (with valid encrypted credentials)
+    conns = [c async for c in db.broker_connections.find({"user_id": str(user["_id"])})]
+    checks.append({
+        "key": "broker_connected",
+        "label": "At least one broker connected",
+        "ok": len(conns) > 0,
+        "detail": f"{len(conns)} broker(s) connected" if conns else "none — connect via Settings",
+    })
+
+    # 4. Per-broker credential validity (last test result)
+    for c in conns:
+        last_ok = c.get("status") == "active"
+        checks.append({
+            "key": f"broker_{c['venue']}_validated",
+            "label": f"{c['venue'].title()} credentials tested",
+            "ok": last_ok,
+            "detail": (
+                "authenticated" if last_ok
+                else f"untested or failed — tap ⚡ in Settings (last: {(c.get('last_test_result') or 'never')[:60]})"
+            ),
+        })
+
+    # 5. Kalshi WS connection (only if Kalshi connected)
+    if any(c["venue"] == "kalshi" for c in conns):
+        ks = _kalshi_my_status(str(user["_id"]))
+        ws_ok = bool(ks and ks.get("connected"))
+        checks.append({
+            "key": "kalshi_ws",
+            "label": "Kalshi WebSocket fill stream",
+            "ok": ws_ok,
+            "detail": (
+                f"connected · {ks['messages']} msgs · {ks['reconnects']} reconnects"
+                if ws_ok else (ks.get("last_error", "not connected") if ks else "stream not started")
+            ),
+        })
+
+    # 6. Push token registered
+    fresh = await db.users.find_one({"_id": user["_id"]})
+    push_tokens = (fresh.get("push_tokens") or []) if fresh else []
+    checks.append({
+        "key": "push_token",
+        "label": "Push notifications enabled",
+        "ok": len(push_tokens) > 0,
+        "detail": f"{len(push_tokens)} device(s)" if push_tokens else "no device registered",
+    })
+
+    overall_ok = all(c["ok"] for c in checks)
+    return {
+        "ok": overall_ok,
+        "checks": checks,
+        "ready_for_live": overall_ok,
+    }
 
 
 @api.get("/brokers/status")
@@ -1681,6 +1783,10 @@ async def upsert_broker_connection(payload: BrokerConnIn, user: dict = Depends(g
         upsert=True,
     )
     await audit(str(user["_id"]), "broker.connect", {"venue": venue, "fingerprint": fp})
+    # Day 3: if this is a Kalshi connection, kick off (or restart) the user's
+    # WebSocket fill stream so we receive real-time fills as soon as they happen.
+    if venue == "kalshi":
+        asyncio.create_task(_kalshi_restart_user(db, str(user["_id"])))
     row = await db.broker_connections.find_one({"user_id": str(user["_id"]), "venue": venue})
     return _public_broker_connection(row or {})
 
@@ -1733,6 +1839,9 @@ async def delete_broker_connection(venue: str, user: dict = Depends(get_current_
             {"_id": user["_id"]},
             {"$set": {"live_broker": None, "live_mode": False}},
         )
+    # Day 3: tear down the Kalshi WS stream when the user disconnects.
+    if venue == "kalshi":
+        asyncio.create_task(_kalshi_stop_user(str(user["_id"])))
     await audit(str(user["_id"]), "broker.disconnect", {"venue": venue})
     return {"ok": True, "deleted": res.deleted_count}
 
@@ -1966,6 +2075,10 @@ async def on_startup():
         logger.info("polygon settlement watcher scheduled")
     else:
         logger.info("POLYGON_RPC_URL not set — polygon settlement watcher disabled")
+
+    # Kalshi WS — boot a stream per user with stored credentials.
+    asyncio.create_task(_kalshi_start_all(db))
+    logger.info("kalshi ws bootstrapper scheduled")
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trackmind.io")

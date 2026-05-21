@@ -750,6 +750,65 @@ frontend:
     needs_retesting: true
     status_history:
       - working: "NA"
+  - task: "Day 3 — Kalshi WS engine + Preflight + Push web shim + Polymarket key derivation"
+    implemented: true
+    working: true
+    file: "backend/kalshi_ws.py, backend/derive_polymarket_keys.py, backend/server.py, frontend/app/settings.tsx, frontend/components/PushBootstrap.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          NEW backend/kalshi_ws.py (~250 lines, lint clean):
+            - KalshiWsClient class — one persistent WS per user with stored kalshi creds
+            - Auth via signed PSS-SHA256 challenge (same as REST broker — reuses stored PEM)
+            - Subscribes to `fill` + `market_lifecycle_v2` channels at handshake
+            - Exponential reconnect backoff (1 → 60s); auto-prunes on unrecoverable PEM errors
+              (InvalidPadding / non-PEM data → stops the loop instead of looping forever)
+            - Per-message handler routes `fill` events → persist to db.kalshi_fills + match
+              open position by kalshi_ticker; SELL fills close the slot + realize PnL +
+              credit user bankroll via $inc (str→ObjectId user_id bridge)
+            - Module API: start_all_streams(db), restart_user_stream(db, user_id),
+              stop_user_stream(user_id), kalshi_status_snapshot(), my_stream_status(user_id)
+          server.py wired:
+            - on_startup launches asyncio.create_task(_kalshi_start_all(db))
+            - upsert_broker_connection (venue=kalshi) → fires _kalshi_restart_user
+            - delete_broker_connection (venue=kalshi) → fires _kalshi_stop_user
+            - /api/exchange/status now includes real Kalshi stream state (per-user + global)
+          NEW endpoint /api/system/preflight:
+            Returns {ok, ready_for_live, checks: [{key, label, ok, detail}]} covering:
+              ✓ master_key set (env var present, ≥32 chars)
+              ✓ polygon_rpc reachable (block + chain id)
+              ✓ broker_connected (count > 0)
+              ✓ each broker's last test result (active vs untested/failed)
+              ✓ kalshi_ws connected (only if Kalshi connected)
+              ✓ push_token registered (≥1 device)
+            Verified: admin (no brokers) returns ready_for_live=false with clear per-check details.
+          NEW backend/derive_polymarket_keys.py — standalone CLI run on user's machine to
+            derive L2 API credentials (api_key/api_secret/api_passphrase) from their EOA
+            private key via py_clob_client.create_or_derive_api_creds(). Prints the 4 values
+            for the user to paste into Settings → Connect Polymarket. Masked input via getpass.
+          Frontend (settings.tsx):
+            - New SYSTEM CHECK card with READY-FOR-LIVE badge (green ✓ / amber ⚠ NOT READY)
+            - Per-check rows: icon, label, detail string
+            - Auto-refreshes every 30s alongside the other cards
+          Frontend (PushBootstrap.tsx):
+            - Wrapped Notifications.setNotificationHandler() in `Platform.OS !== "web"` guard
+            - Silences the "[expo-notifications] Listening to push token changes is not yet
+              fully supported on web" warning that spammed dev console
+          Verification:
+            ✓ 28/28 backend tests still pass — zero regression
+            ✓ Lint clean (ruff)
+            ✓ /api/system/preflight verified end-to-end
+            ✓ Settings screen renders the new SYSTEM CHECK card correctly (screenshot)
+            ✓ Kalshi WS connection lifecycle verified (bad PEM → stops gracefully; reconnect
+              on transient errors)
+          Day 4 next (Friday): user pastes real Kalshi + Polymarket creds → SYSTEM CHECK
+          goes green → first $1 live trade → push notification arrives → settle event lands
+          in db.polygon_events → done.
+
   - task: "Day 2 — Polymarket CTF event decoder + settlement matching + live-trade safety cap"
     implemented: true
     working: true

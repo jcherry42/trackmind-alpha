@@ -52,6 +52,9 @@ type NotifyPrefs = {
   kill_switch: boolean;
 };
 
+type PreflightCheck = { key: string; label: string; ok: boolean; detail: string };
+type PreflightResult = { ok: boolean; checks: PreflightCheck[]; ready_for_live: boolean };
+
 const NOTIFY_ROWS: Array<{ key: keyof NotifyPrefs; label: string; hint: string; icon: any }> = [
   { key: "master_signal", label: "Master Signal", hint: "High-conviction multi-engine alert", icon: "zap" },
   { key: "position_settled", label: "Position Settled", hint: "Win/loss + realized PnL", icon: "check-circle" },
@@ -70,23 +73,26 @@ export default function SettingsScreen() {
   const [connections, setConnections] = useState<BrokerConnection[]>([]);
   const [risk, setRisk] = useState<RiskLimits | null>(null);
   const [notify, setNotify] = useState<NotifyPrefs | null>(null);
+  const [preflight, setPreflight] = useState<PreflightResult | null>(null);
   const [modalVenue, setModalVenue] = useState<"polymarket" | "kalshi" | null>(null);
   const [riskOpen, setRiskOpen] = useState(false);
 
   const reload = async () => {
     try {
-      const [q, b, c, r, n] = await Promise.all([
+      const [q, b, c, r, n, pf] = await Promise.all([
         api<Quota>("/me/quota"),
         api<BrokersStatus>("/brokers/status"),
         api<{ connections: BrokerConnection[] }>("/me/broker-connections"),
         api<RiskLimits>("/me/risk-limits"),
         api<{ prefs: NotifyPrefs }>("/me/notification-prefs"),
+        api<PreflightResult>("/system/preflight"),
       ]);
       setQuota(q);
       setBrokers(b);
       setConnections(c.connections || []);
       setRisk(r);
       setNotify(n.prefs);
+      setPreflight(pf);
     } catch {
       /* silent — non-critical */
     }
@@ -289,7 +295,46 @@ export default function SettingsScreen() {
         </Card>
 
         <Card>
-          <Text style={styles.metricLabel}>BROKER CONNECTIONS</Text>
+          <View style={{ flexDirection: "row", alignItems: "center", marginBottom: space.sm }}>
+            <Text style={[styles.metricLabel, { flex: 1 }]}>SYSTEM CHECK</Text>
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: preflight?.ready_for_live ? colors.positive : colors.alpha, marginRight: 6 },
+              ]}
+            />
+            <Text style={{ color: preflight?.ready_for_live ? colors.positive : colors.alpha, fontSize: 11, fontWeight: "700", letterSpacing: 0.6 }}>
+              {preflight?.ready_for_live ? "READY FOR LIVE" : "NOT READY"}
+            </Text>
+          </View>
+          {preflight ? (
+            preflight.checks.map((c, idx) => (
+              <View
+                key={c.key}
+                style={[
+                  styles.notifyRow,
+                  idx === preflight.checks.length - 1 && { borderBottomWidth: 0 },
+                ]}
+              >
+                <View style={styles.notifyIcon}>
+                  <Feather
+                    name={c.ok ? "check-circle" : "alert-circle"}
+                    size={16}
+                    color={c.ok ? colors.positive : colors.alpha}
+                  />
+                </View>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.rowLabel}>{c.label}</Text>
+                  <Text style={styles.subtle}>{c.detail}</Text>
+                </View>
+              </View>
+            ))
+          ) : (
+            <Text style={styles.subtle}>Running checks…</Text>
+          )}
+        </Card>
+
+        <Card>
           <Text style={[styles.subtle, { marginBottom: space.sm }]}>
             Credentials are encrypted at-rest with Fernet (AES-128 + HMAC) using your master
             key. Tested before any live order is routed.

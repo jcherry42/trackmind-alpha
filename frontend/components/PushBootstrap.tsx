@@ -12,14 +12,19 @@ import { useAuth } from "../lib/auth";
 import { api } from "../lib/api";
 
 // Default behaviour: show banner + play sound for foreground notifications.
-Notifications.setNotificationHandler({
-  handleNotification: async () => ({
-    shouldShowBanner: true,
-    shouldShowList: true,
-    shouldPlaySound: true,
-    shouldSetBadge: true,
-  }),
-});
+// Skip on web — expo-notifications doesn't have a real push pipeline there and
+// calling setNotificationHandler triggers the noisy "not yet fully supported on
+// web" listener warnings that spam the console.
+if (Platform.OS !== "web") {
+  Notifications.setNotificationHandler({
+    handleNotification: async () => ({
+      shouldShowBanner: true,
+      shouldShowList: true,
+      shouldPlaySound: true,
+      shouldSetBadge: true,
+    }),
+  });
+}
 
 async function registerForPushNotifications(): Promise<string | null> {
   if (Platform.OS === "web") return null;
