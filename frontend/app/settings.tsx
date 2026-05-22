@@ -536,6 +536,30 @@ export default function SettingsScreen() {
         </Card>
 
         <Card>
+          <Pressable
+            onPress={() => router.push("/whales")}
+            style={{
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "space-between",
+              paddingVertical: space.sm,
+            }}
+            accessibilityLabel="Open whale tracking"
+          >
+            <View style={{ flex: 1 }}>
+              <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+                <Feather name="anchor" size={16} color={colors.whale} />
+                <Text style={styles.metricLabel}>WHALE TRACKING</Text>
+              </View>
+              <Text style={[styles.subtle, { marginTop: 6 }]}>
+                Live Polymarket whale activity · Mirror trades into your account
+              </Text>
+            </View>
+            <Feather name="chevron-right" size={20} color={colors.textTertiary} />
+          </Pressable>
+        </Card>
+
+        <Card>
           <Text style={styles.metricLabel}>NOTIFICATIONS</Text>
           <Text style={[styles.subtle, { marginBottom: space.sm }]}>
             Per-event push controls. Defaults are all on — toggle any category off to silence it.

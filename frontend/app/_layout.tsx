@@ -44,6 +44,10 @@ export default function RootLayout() {
                   name="legal/terms"
                   options={{ presentation: "modal", animation: "slide_from_bottom" }}
                 />
+                <Stack.Screen
+                  name="whales"
+                  options={{ presentation: "modal", animation: "slide_from_bottom" }}
+                />
               </Stack>
             </AuthProvider>
           </SnackbarProvider>

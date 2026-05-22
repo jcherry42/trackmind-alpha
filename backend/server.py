@@ -450,7 +450,7 @@ async def refresh_engines() -> None:
         pass
 
     quant_signals = quant_engine.run()
-    whale_signals = whale_engine.run()
+    whale_signals = await whale_engine.run_async(db)
     micro_signals = micro_engine.run()
 
     # After signals are computed below, attempt to fan out a master-signal alert.
@@ -2114,6 +2114,306 @@ async def admin_audit(
     return {"events": rows, "count": len(rows)}
 
 
+# ============================================================================
+# Whale tracking & mirror-trade endpoints
+# ============================================================================
+import re as _re_whale  # noqa: E402
+
+_ETH_ADDR_RE = _re_whale.compile(r"^0x[0-9a-fA-F]{40}$")
+
+
+class TrackedWalletIn(BaseModel):
+    address: str
+    label: Optional[str] = None
+    note: Optional[str] = None
+
+
+class MirrorTradeIn(BaseModel):
+    entry_id: str  # whale_entries._id (as string)
+    notional: Optional[float] = None  # default = clamped to user's max_trade_pct
+
+
+def _serialize_tracked_wallet(w: dict) -> dict:
+    return {
+        "id": str(w["_id"]),
+        "address": w.get("address"),
+        "label": w.get("label"),
+        "note": w.get("note"),
+        "source": w.get("source", "admin"),
+        "is_active": bool(w.get("is_active", True)),
+        "entries_count": int(w.get("entries_count", 0)),
+        "last_polled_at": w["last_polled_at"].isoformat() if w.get("last_polled_at") else None,
+        "last_entry_at": w["last_entry_at"].isoformat() if w.get("last_entry_at") else None,
+        "added_by_user_id": w.get("added_by_user_id"),
+        "created_at": w["created_at"].isoformat() if w.get("created_at") else None,
+    }
+
+
+def _serialize_whale_entry(e: dict) -> dict:
+    return {
+        "id": str(e["_id"]),
+        "transaction_hash": e.get("transaction_hash"),
+        "wallet_address": e.get("wallet_address"),
+        "wallet_label": e.get("wallet_label"),
+        "condition_id": e.get("condition_id"),
+        "canonical_id": e.get("canonical_id"),
+        "side": e.get("side"),
+        "outcome": e.get("outcome"),
+        "price": e.get("price"),
+        "usdc_size": e.get("usdc_size"),
+        "size_shares": e.get("size_shares"),
+        "title": e.get("title"),
+        "slug": e.get("slug"),
+        "ts": e.get("ts"),
+        "observed_at": e["observed_at"].isoformat() if e.get("observed_at") else None,
+    }
+
+
+@api.get("/whales/wallets")
+async def list_tracked_wallets(user: dict = Depends(get_current_user)):
+    """List tracked wallets visible to caller: all admin-seeded + caller's own additions."""
+    user_id = str(user["_id"])
+    q = {"$or": [{"source": "admin"}, {"added_by_user_id": user_id}]}
+    rows = [_serialize_tracked_wallet(w) async for w in db.tracked_wallets.find(q).sort("created_at", 1)]
+    return {"wallets": rows, "count": len(rows)}
+
+
+@api.post("/whales/wallets")
+async def add_tracked_wallet(payload: TrackedWalletIn, user: dict = Depends(get_current_user)):
+    """User adds a custom wallet to their personal tracking list. Address must be a valid EOA hex."""
+    addr = (payload.address or "").strip()
+    if not _ETH_ADDR_RE.match(addr):
+        raise HTTPException(status_code=400, detail="Invalid Ethereum address (need 0x + 40 hex)")
+    addr_lc = addr.lower()
+    user_id = str(user["_id"])
+    # If admin-seeded version exists, refuse — admin entries are global.
+    existing = await db.tracked_wallets.find_one({"address": addr_lc})
+    if existing:
+        if existing.get("source") == "admin":
+            return {"ok": True, "already_tracked": True, "wallet": _serialize_tracked_wallet(existing)}
+        if existing.get("added_by_user_id") == user_id:
+            return {"ok": True, "already_tracked": True, "wallet": _serialize_tracked_wallet(existing)}
+        raise HTTPException(status_code=409, detail="Wallet already tracked by another user")
+    now = datetime.now(timezone.utc)
+    doc = {
+        "address": addr_lc,
+        "label": (payload.label or addr_lc[:6] + "…" + addr_lc[-4:]),
+        "note": payload.note,
+        "source": "user",
+        "added_by_user_id": user_id,
+        "is_active": True,
+        "hit_rate_30d": None,
+        "total_volume_30d": None,
+        "last_polled_at": None,
+        "last_entry_at": None,
+        "entries_count": 0,
+        "created_at": now,
+    }
+    res = await db.tracked_wallets.insert_one(doc)
+    doc["_id"] = res.inserted_id
+    await audit(user_id, "whale.wallet_added", {"address": addr_lc, "label": payload.label})
+    return {"ok": True, "wallet": _serialize_tracked_wallet(doc)}
+
+
+@api.delete("/whales/wallets/{address}")
+async def remove_tracked_wallet(address: str, user: dict = Depends(get_current_user)):
+    """Remove a wallet the caller added themselves. Admin-seeded entries are protected."""
+    addr_lc = (address or "").lower()
+    user_id = str(user["_id"])
+    existing = await db.tracked_wallets.find_one({"address": addr_lc})
+    if not existing:
+        return {"ok": True, "deleted": 0}
+    if existing.get("source") == "admin":
+        raise HTTPException(status_code=403, detail="Cannot remove admin-seeded wallet")
+    if existing.get("added_by_user_id") != user_id and user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Not your wallet")
+    res = await db.tracked_wallets.delete_one({"_id": existing["_id"]})
+    await audit(user_id, "whale.wallet_removed", {"address": addr_lc})
+    return {"ok": True, "deleted": res.deleted_count}
+
+
+@api.get("/whales/recent")
+async def whale_recent_entries(limit: int = 30, user: dict = Depends(get_current_user)):
+    """Recent whale entries observed across all tracked wallets (last 24h)."""
+    limit = max(1, min(200, limit))
+    since = datetime.now(timezone.utc) - timedelta(hours=24)
+    rows = [
+        _serialize_whale_entry(e)
+        async for e in db.whale_entries.find({"observed_at": {"$gte": since}})
+        .sort("ts", -1)
+        .limit(limit)
+    ]
+    return {"entries": rows, "count": len(rows)}
+
+
+@api.post("/whales/mirror")
+async def whale_mirror_trade(
+    payload: MirrorTradeIn,
+    request: Request,
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+    user: dict = Depends(get_current_user),
+):
+    """Mirror a specific whale entry into a same-side paper/live trade for the caller.
+
+    Reuses the standard approve_trade pipeline (atomic debit, per-trade cap, daily
+    loss circuit, live-trade safety cap). The caller's `max_trade_pct` is enforced;
+    if `notional` is omitted, we size to that cap automatically.
+
+    The mirror only works if we can map the whale's `conditionId` to a currently
+    LIVE Polymarket market — i.e. the entry's `canonical_id` is not null. Otherwise
+    400 with detail explaining the market is unavailable.
+    """
+    user = await db.users.find_one({"_id": user["_id"]})
+    user_id = str(user["_id"])
+    # Lookup the whale entry by id.
+    try:
+        eid = ObjectId(payload.entry_id) if len(payload.entry_id) == 24 else None
+    except Exception:  # noqa: BLE001
+        eid = None
+    if not eid:
+        raise HTTPException(status_code=400, detail="Invalid entry_id")
+    entry = await db.whale_entries.find_one({"_id": eid})
+    if not entry:
+        raise HTTPException(status_code=404, detail="Whale entry not found")
+    cid = entry.get("canonical_id")
+    if not cid:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot mirror — Polymarket conditionId is not in our live market set right now.",
+        )
+    quote = market_store.get("polymarket", cid)
+    if not quote:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot mirror — market is no longer live or has settled.",
+        )
+    side = entry.get("side") or "YES"
+    price = quote.yes if side == "YES" else quote.no
+
+    # Build a synthetic signal mirroring the whale entry.
+    bankroll = float(user.get("bankroll", 0.0))
+    mt_pct = max(0.0001, min(0.20, float(user.get("max_trade_pct") or 0.02)))
+    max_dollar = bankroll * mt_pct
+    requested = payload.notional if payload.notional is not None else max_dollar
+    requested = max(1.0, float(requested))
+    if requested > max_dollar:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Mirror notional ${requested:.2f} exceeds per-trade cap "
+                f"${max_dollar:.2f} ({mt_pct*100:.2f}% of bankroll)."
+            ),
+        )
+    # Daily-loss circuit (reuse same guard as approve_trade).
+    _check_daily_loss_circuit(user)
+    # Atomic debit.
+    ok = await _atomic_bankroll_debit(user["_id"], requested)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Insufficient bankroll")
+    # Build the signal + execute via the active broker.
+    sig = {
+        "id": f"mirror_{entry['transaction_hash'][:14]}_{int(time.time())}",
+        "engine": "whale",
+        "canonical_id": cid,
+        "venue": "polymarket",
+        "market": quote.title,
+        "side": side,
+        "price": price,
+        "confidence": 0.80,
+        "expected_edge": 0.05,
+        "risk": 0.03,
+        "liquidity": float(quote.liquidity),
+        "size_hint": 0.05,
+        "rationale": (
+            f"Mirror of {entry.get('wallet_label') or entry.get('wallet_address', '')[:10]} · "
+            f"${float(entry.get('usdc_size') or 0):,.0f} @ {entry.get('price')}"
+        ),
+        "polymarket_condition_id": (entry.get("condition_id") or "").lower() or None,
+    }
+    try:
+        broker = await resolve_broker_for_user_async(db, user)
+        fill = await broker.place_order(user_id=user_id, signal=sig, notional=requested)
+    except Exception as e:
+        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": requested}})
+        raise HTTPException(status_code=502, detail=f"Broker error: {e}")
+    pos_doc = {
+        "user_id": user_id,
+        "engine": "whale",
+        "canonical_id": cid,
+        "market": quote.title,
+        "venue": "polymarket",
+        "side": side,
+        "entry_price": fill["price"],
+        "current_price": fill["price"],
+        "contracts": fill["contracts"],
+        "notional": fill["notional"],
+        "fees": fill["fees"],
+        "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
+        "expected_edge": sig["expected_edge"],
+        "confidence": sig["confidence"],
+        "status": "open",
+        "unrealized_pnl": 0.0,
+        "opened_at": datetime.now(timezone.utc),
+        "broker": fill["broker"],
+        "fill_id": fill["id"],
+        "signal_id": sig["id"],
+        "polymarket_condition_id": sig["polymarket_condition_id"],
+        "mirror_of_entry_id": str(entry["_id"]),
+        "mirror_of_tx": entry.get("transaction_hash"),
+        "mirror_of_wallet": entry.get("wallet_address"),
+    }
+    res = await db.positions.insert_one(pos_doc)
+    pos_doc["_id"] = res.inserted_id
+    # Track live notional + P2 metric.
+    if fill.get("broker") in ("polymarket", "kalshi"):
+        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        await db.users.update_one(
+            {"_id": user["_id"]},
+            [{"$set": {
+                "live_notional_today_date": today_key,
+                "live_notional_today": {
+                    "$cond": [
+                        {"$eq": ["$live_notional_today_date", today_key]},
+                        {"$add": [{"$ifNull": ["$live_notional_today", 0]}, fill["notional"]]},
+                        fill["notional"],
+                    ]
+                },
+            }}],
+        )
+        try:
+            from observability import live_orders_placed_total
+            live_orders_placed_total.labels(
+                venue=fill["broker"], side=side.lower()
+            ).inc()
+        except Exception:  # noqa: BLE001
+            pass
+    await audit(user_id, "whale.mirror", {
+        "entry_id": str(entry["_id"]),
+        "wallet": entry.get("wallet_address"),
+        "notional": fill["notional"],
+        "side": side,
+    })
+    return {"position": _serialize_position(pos_doc), "fill": fill}
+
+
+@api.get("/whales/status")
+async def whale_status(user: dict = Depends(get_current_user)):
+    """Status snapshot of the whale tracker (poll loop)."""
+    try:
+        from whale_tracker import status_snapshot
+        snap = status_snapshot()
+    except Exception:  # noqa: BLE001
+        snap = {"available": False}
+    total_wallets = await db.tracked_wallets.count_documents({"is_active": True})
+    user_id = str(user["_id"])
+    user_added = await db.tracked_wallets.count_documents({"added_by_user_id": user_id})
+    entries_24h = await db.whale_entries.count_documents({
+        "observed_at": {"$gte": datetime.now(timezone.utc) - timedelta(hours=24)}
+    })
+    return {**snap, "total_tracked_wallets": total_wallets, "user_added_wallets": user_added,
+            "entries_24h": entries_24h}
+
+
 app.include_router(api)
 
 
@@ -2184,6 +2484,15 @@ async def on_startup():
     # Kalshi WS — boot a stream per user with stored credentials.
     asyncio.create_task(_kalshi_start_all(db))
     logger.info("kalshi ws bootstrapper scheduled")
+
+    # Whale tracker — polls Polymarket's public Data API for tracked wallets.
+    # Seeds 8 default wallets on first boot, then polls every 90s.
+    try:
+        from whale_tracker import poll_loop as _whale_poll_loop
+        asyncio.create_task(_whale_poll_loop(db))
+        logger.info("whale tracker scheduled")
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"whale tracker not started: {e}")
 
     # Seed admin
     admin_email = os.environ.get("ADMIN_EMAIL", "admin@trackmind.io")
