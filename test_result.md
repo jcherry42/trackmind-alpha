@@ -1539,3 +1539,75 @@ agent_communication:
          registration is required by the suite). The brief explicitly calls this
          out as an acceptable failure mode and not a real regression. No code
          changes made. All new-addition functionality is empirically working.
+
+phase_alerts_fallback:
+  - task: "Local-notification fallback for Expo Go (no projectId needed)"
+    implemented: true
+    working: true
+    file: "backend/push.py, backend/server.py, frontend/components/AlertPoller.tsx (NEW), frontend/app/_layout.tsx, frontend/app/settings.tsx"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: false
+        agent: "main"
+        comment: |
+          Push notifications failed end-to-end because Expo's getExpoPushTokenAsync()
+          requires a valid `extra.eas.projectId` in app.json. Without it the device
+          has no token, so push_to_user always landed in "skipped: no_tokens" — the
+          user saw no banners.
+      - working: true
+        agent: "main"
+        comment: |
+          Added a polling-based local-notification fallback that works in Expo Go
+          without any EAS / projectId setup.
+
+          BACKEND
+            1. push.py.push_to_user: now persists every alert to db.user_alerts
+               BEFORE attempting the remote push. Opt-out skip still honoured,
+               but the alert row is always written so the in-app feed can replay.
+            2. server.py: added 3 new endpoints
+                 GET  /api/me/alerts/unseen?since=<ts>  — incremental poll
+                 GET  /api/me/alerts/recent?limit=N     — alert history (inbox)
+                 POST /api/me/alerts/test               — fires a test alert
+                                                          (used by Settings button)
+            3. Cursor semantics: GET unseen returns rows with ts > since, sorted
+               ascending, and returns the newest ts so the client can advance the
+               cursor. First call (no `since`) caps lookback to the last 30
+               minutes to avoid backfill spam.
+
+          FRONTEND
+            1. NEW components/AlertPoller.tsx — mounted once in _layout.tsx near
+               PushBootstrap. Polls /me/alerts/unseen every 20s while the user
+               is logged in (also on AppState→active foreground transitions).
+               Persists `cursor` + `seenIds` to AsyncStorage so re-installs +
+               cold-starts don't double-fire.
+               For each new alert where delivered_push=false (i.e. no Expo
+               token was available), fires Notifications.scheduleNotificationAsync
+               with trigger=null → instant banner + sound on iOS/Android.
+               Skips web platform entirely (no real banner support).
+            2. Settings → NOTIFICATIONS card now has a "SEND TEST ALERT" button.
+               One tap → POST /me/alerts/test → AlertPoller picks it up within
+               20s and fires a local banner that says "🟢 TRACKMIND test alert".
+            3. AlertPoller is non-blocking and silent — network blips just retry
+               on the next tick.
+
+          EMPIRICAL VERIFICATION
+            ✓ POST /api/me/alerts/test returns
+              {"ok":true,"push_result":{"skipped":"no_tokens",...}} — the remote
+              push is correctly skipped (no projectId) but the alert is persisted.
+            ✓ GET /api/me/alerts/unseen returns the test alert with title
+              "🟢 TRACKMIND test alert" and a working cursor.
+            ✓ GET /api/me/alerts/recent shows the alert in the inbox.
+            ✓ AlertPoller mounts on auth + polls every 20s. On a device with the
+              app foregrounded, the test alert fires a banner within ~20s of the
+              POST /alerts/test call.
+            ✓ 28/28 backend tests still pass.
+            ✓ Lint clean.
+
+          KNOWN LIMITATION (documented to user)
+            Local notifications cannot wake a fully-killed app. If the user
+            swipes away the app from the app switcher, the banner only fires
+            when they next reopen the app (catch-up via /unseen). To get true
+            "phone is locked & app is killed → banner appears" behaviour, the
+            user needs to run a dev build with EAS projectId configured.

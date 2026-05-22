@@ -2452,6 +2452,92 @@ async def whale_status(user: dict = Depends(get_current_user)):
             "entries_24h": entries_24h}
 
 
+# ============================================================================
+# In-app alert poller — fallback for Expo Go users without a projectId.
+# Every event that goes through `push_to_user` ALSO writes a row to `user_alerts`.
+# The frontend polls this endpoint while the app is open and fires a LOCAL
+# notification (banner + sound) for each new entry. Works in Expo Go without
+# any EAS / projectId configuration.
+# ============================================================================
+@api.get("/me/alerts/unseen")
+async def alerts_unseen(
+    since: Optional[float] = None,
+    limit: int = 20,
+    user: dict = Depends(get_current_user),
+):
+    """Return alerts for the current user newer than `since` (unix ts).
+
+    The frontend AlertPoller persists the cursor in AsyncStorage and ticks every
+    ~20s. Cursor is exclusive (returns ts > since). If `since` is omitted, we
+    cap the lookback to the last 30 minutes to avoid spamming on first install.
+    """
+    limit = max(1, min(50, limit))
+    if since is None:
+        since = (datetime.now(timezone.utc) - timedelta(minutes=30)).timestamp()
+    rows = [
+        {
+            "id": str(r["_id"]),
+            "category": r.get("category"),
+            "title": r.get("title"),
+            "body": r.get("body"),
+            "data": r.get("data") or {},
+            "ts": r.get("ts"),
+            "delivered_push": bool(r.get("delivered_push")),
+        }
+        async for r in db.user_alerts
+        .find({"user_id": str(user["_id"]), "ts": {"$gt": since}})
+        .sort("ts", 1)
+        .limit(limit)
+    ]
+    cursor = rows[-1]["ts"] if rows else since
+    return {"alerts": rows, "count": len(rows), "cursor": cursor}
+
+
+@api.get("/me/alerts/recent")
+async def alerts_recent(
+    limit: int = 50,
+    user: dict = Depends(get_current_user),
+):
+    """In-app alert history (most recent first). Powers the alerts inbox UI."""
+    limit = max(1, min(200, limit))
+    rows = [
+        {
+            "id": str(r["_id"]),
+            "category": r.get("category"),
+            "title": r.get("title"),
+            "body": r.get("body"),
+            "data": r.get("data") or {},
+            "ts": r.get("ts"),
+            "delivered_push": bool(r.get("delivered_push")),
+        }
+        async for r in db.user_alerts
+        .find({"user_id": str(user["_id"])})
+        .sort("ts", -1)
+        .limit(limit)
+    ]
+    return {"alerts": rows, "count": len(rows)}
+
+
+@api.post("/me/alerts/test")
+async def alerts_send_test(user: dict = Depends(get_current_user)):
+    """Fire a TEST notification for the current user (both remote push if token
+    exists AND the local-notification fallback via the next /unseen poll).
+
+    Useful for confirming push wiring is working end-to-end without waiting for
+    a real signal/settlement event to occur naturally.
+    """
+    from push import push_to_user
+    result = await push_to_user(
+        db,
+        user,
+        category="master_signal",
+        title="🟢 TRACKMIND test alert",
+        body="If you see this banner, alerts are wired correctly.",
+        data={"test": True, "ts": time.time()},
+    )
+    return {"ok": True, "push_result": result}
+
+
 app.include_router(api)
 
 

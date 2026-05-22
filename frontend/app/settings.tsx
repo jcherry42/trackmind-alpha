@@ -654,6 +654,49 @@ export default function SettingsScreen() {
               </View>
             );
           })}
+
+          <Pressable
+            onPress={async () => {
+              try {
+                await api("/me/alerts/test", { method: "POST" });
+                snack.show({
+                  message: "Test alert sent — banner appears within ~20s.",
+                  kind: "success",
+                });
+              } catch (e: any) {
+                snack.show({
+                  message: e?.message || "Test alert failed",
+                  kind: "error",
+                });
+              }
+            }}
+            disabled={busy}
+            style={({ pressed }) => ({
+              marginTop: space.md,
+              paddingVertical: 12,
+              paddingHorizontal: space.md,
+              borderRadius: 8,
+              borderWidth: 1,
+              borderColor: colors.borderSubtle,
+              flexDirection: "row",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 8,
+              opacity: pressed ? 0.6 : 1,
+            })}
+          >
+            <Feather name="bell" size={14} color={colors.textPrimary} />
+            <Text
+              style={{
+                color: colors.textPrimary,
+                fontSize: 12,
+                letterSpacing: 1.2,
+                fontWeight: "700",
+              }}
+            >
+              SEND TEST ALERT
+            </Text>
+          </Pressable>
         </Card>
 
         <View style={{ marginTop: space.md }}>

@@ -8,6 +8,7 @@ import { colors } from "../lib/theme";
 import { ErrorBoundary } from "../components/ErrorBoundary";
 import { SnackbarProvider } from "../components/Snackbar";
 import { PushBootstrap } from "../components/PushBootstrap";
+import { AlertPoller } from "../components/AlertPoller";
 
 export default function RootLayout() {
   return (
@@ -17,6 +18,7 @@ export default function RootLayout() {
           <SnackbarProvider>
             <AuthProvider>
               <PushBootstrap />
+              <AlertPoller />
               <StatusBar style="light" />
               <Stack
                 screenOptions={{

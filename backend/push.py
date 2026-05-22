@@ -130,15 +130,39 @@ async def push_to_user(
 ) -> dict:
     """Send a push to a single user IF their prefs permit `category`.
 
-    No-ops silently when:
-      - category is opted-out
-      - the user has no push tokens stored
-      - all tokens are filtered as invalid
+    Behaviour:
+      - Always persists the alert to `db.user_alerts` for in-app history AND for
+        the Expo Go local-notification fallback (polled by frontend AlertPoller).
+      - Skips the actual remote push when category is opted-out or no tokens
+        exist — but still writes the alert row so the in-app feed works.
 
     Auto-prunes tokens Expo reports as DeviceNotRegistered.
     """
+    import time as _time
+    from datetime import datetime, timezone
+
+    # 1) Always persist the alert (used by /api/me/alerts/unseen poller).
+    alert_doc = {
+        "user_id": str(user["_id"]),
+        "category": category,
+        "title": title,
+        "body": body,
+        "data": data or {},
+        "ts": _time.time(),
+        "created_at": datetime.now(timezone.utc),
+        "delivered_push": False,
+    }
+    try:
+        ins = await db.user_alerts.insert_one(alert_doc)
+        alert_doc["_id"] = ins.inserted_id
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"persist user_alert failed: {e}")
+
+    # 2) Honour opt-out.
     if not user_wants(user, category):
         return {"ok": 0, "failed": 0, "invalid_tokens": [], "skipped": "opted_out"}
+
+    # 3) Remote push when there ARE tokens; otherwise the AlertPoller picks it up.
     tokens = [t.get("token") for t in (user.get("push_tokens") or []) if isinstance(t, dict)]
     tokens = [t for t in tokens if t]
     if not tokens:
@@ -151,4 +175,13 @@ async def push_to_user(
             {"_id": user["_id"]},
             {"$pull": {"push_tokens": {"token": {"$in": bad}}}},
         )
+    # Mark the alert as remote-push-delivered when ≥1 token succeeded.
+    if result.get("ok", 0) > 0 and alert_doc.get("_id") is not None:
+        try:
+            await db.user_alerts.update_one(
+                {"_id": alert_doc["_id"]},
+                {"$set": {"delivered_push": True}},
+            )
+        except Exception:  # noqa: BLE001
+            pass
     return result
