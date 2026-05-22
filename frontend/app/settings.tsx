@@ -272,8 +272,11 @@ export default function SettingsScreen() {
             <View style={{ flex: 1, paddingRight: space.sm }}>
               <Text style={styles.rowLabel}>Live Trading</Text>
               <Text style={styles.subtle}>
-                Live mode routes orders to your selected venue. Falls back to paper
-                if the chosen venue isn't configured server-side.
+                {!brokers?.current_user.live_broker
+                  ? "Connect a broker + route to it below before flipping this on."
+                  : user?.live_mode
+                  ? `LIVE · routing orders to ${brokers.current_user.live_broker.toUpperCase()}`
+                  : `Paper · ready to flip to ${brokers.current_user.live_broker.toUpperCase()}`}
               </Text>
             </View>
             <Switch
@@ -281,19 +284,73 @@ export default function SettingsScreen() {
               value={!!user?.live_mode}
               onValueChange={(v) => {
                 if (v && !brokers?.current_user.live_broker) {
-                  snack.show({
-                    message: "Pick a live broker first.",
-                    kind: "warning",
-                  });
+                  Alert.alert(
+                    "Pick a live broker first",
+                    "Live mode routes real orders to your selected venue. " +
+                      "To enable it:\n\n" +
+                      "1. Tap '+' next to Polymarket or Kalshi below and paste credentials\n" +
+                      "2. Tap the Polymarket/Kalshi pill under 'ROUTE LIVE ORDERS TO'\n" +
+                      "3. Then come back and toggle this switch on.",
+                    [{ text: "OK" }],
+                  );
                   return;
                 }
-                setFlag("live_mode", v);
+                if (v) {
+                  // Confirm transition to live with a brief warning so users
+                  // can't accidentally arm real-money trading.
+                  Alert.alert(
+                    `Go LIVE on ${brokers!.current_user.live_broker!.toUpperCase()}?`,
+                    `Trades will be routed to a real broker. ` +
+                      `Daily safety cap: $50 notional. Per-trade cap respects your risk-limits setting. ` +
+                      `You can flip back to paper anytime.`,
+                    [
+                      { text: "Cancel", style: "cancel" },
+                      {
+                        text: "ARM LIVE TRADING",
+                        style: "destructive",
+                        onPress: () => setFlag("live_mode", true),
+                      },
+                    ],
+                  );
+                  return;
+                }
+                setFlag("live_mode", false);
               }}
-              disabled={busy}
+              disabled={busy || !brokers?.current_user.live_broker}
               trackColor={{ false: colors.modal, true: colors.negative }}
-              thumbColor={user?.live_mode ? colors.negative : colors.textTertiary}
+              thumbColor={
+                !brokers?.current_user.live_broker
+                  ? colors.textTertiary
+                  : user?.live_mode
+                  ? colors.negative
+                  : colors.textTertiary
+              }
+              style={
+                !brokers?.current_user.live_broker
+                  ? { opacity: 0.45 }
+                  : undefined
+              }
             />
           </View>
+          {!brokers?.current_user.live_broker && (
+            <View
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                marginTop: space.sm,
+                paddingTop: space.sm,
+                borderTopWidth: 1,
+                borderTopColor: colors.borderSubtle,
+                gap: 8,
+              }}
+            >
+              <Feather name="info" size={14} color={colors.alpha} />
+              <Text style={[styles.subtle, { flex: 1, color: colors.alpha }]}>
+                Live mode is gated by an active broker route. Set one in the
+                section below.
+              </Text>
+            </View>
+          )}
         </Card>
 
         <Card>
