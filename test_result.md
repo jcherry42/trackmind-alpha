@@ -1361,3 +1361,181 @@ phase_whale_mirror:
           (b) re-testing the mirror "happy path" once at least one whale
           entry has a non-null canonical_id (market-coverage dependent;
           out of code's control).
+
+phase_sports_curation:
+  - task: "Sports ingest — NBA/NFL/MLB/NHL/NCAAF/NCAAB added to live_market"
+    implemented: true
+    working: true
+    file: "backend/live_market.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Added per-sport Polymarket fetch via Gamma /events?tag_slug=<sport>.
+          Tags: nba, nfl, mlb, nhl, ncaaf, college-football, ncaab,
+          college-basketball. Each pulls top events by volume24hr, flattens
+          embedded markets, parses via shared _parse_polymarket_market helper.
+          Cap: MAX_MARKETS_PER_SPORT=10 per tag (env tunable), global hard cap
+          POLYMARKET_HARD_CAP=100 (was 30). Dedup by canonical_id across
+          top-by-volume + sports streams.
+
+          Empirical verification:
+            ✓ Live ingest log shows: "polymarket=85, kalshi=27, total=112,
+              sports: nba=10 nfl=10 mlb=10 nhl=10 ncaaf=10 college-football=10"
+            ✓ GET /api/markets shows 46 sports markets in the store (NBA props
+              like SGA Points O/U, NHL spreads, NFL totals).
+            ✓ 28/28 backend tests still pass — zero regression.
+            ✓ Lint clean.
+  - task: "Whale wallet curation — replaced 6 fake addresses with 10 verified top-volume/top-profit wallets"
+    implemented: true
+    working: true
+    file: "backend/whale_tracker.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Discovered Polymarket's public leaderboard API (lb-api.polymarket.com/
+          {profit,volume}?window=Nd&limit=N). Pulled top 20 by 7d volume + top 10
+          by 7d profit. Individually verified each candidate via
+          /activity?user=<addr> to confirm BUY trades ≥$500 USDC exist.
+
+          New 10-wallet curated seed list (all verified, real Polymarket
+          pseudonyms): tubeyou ($13M/7d), Multicolored-Self ($1.77M monthly),
+          swisstony ($27M/7d, +$624k), restart77 ($25M/7d), RN1 ($20M/7d),
+          mooseborzoi ($18M/7d), LaBradfordSmith22 (+$714k 7d profit),
+          bcda (+$557k), VPenguin (+$899k top profit), Whale-F705 (+$1.85M
+          all-time crypto).
+
+          Made seed_default_wallets() idempotent + refreshing: upserts each
+          new wallet (preserves entries_count + history), retires
+          (is_active=false) admin wallets not in the current default list.
+          User-added wallets are never touched.
+
+          Empirical verification:
+            ✓ After reload: GET /whales/wallets returns 10 active curated wallets.
+            ✓ GET /whales/wallets?include_retired=true returns 17 (10 new + 7
+              old fakes correctly retired).
+            ✓ Log line: "whale_tracker: retired 7 admin wallets (off the new seed list)".
+            ✓ 28/28 backend tests still pass.
+  - task: "Engine convenience aliases /api/signals/{whale,alpha,quant}"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: true
+    status_history:
+      - working: true
+        agent: "main"
+        comment: |
+          Added /api/signals/whale, /api/signals/alpha, /api/signals/quant
+          (parity with the existing /api/signals/micro). Each accepts limit
+          (1-100, default 20), returns sorted-by-score list with count.
+          Resolves the testing agent's earlier request for a /signals/whale
+          alias.
+
+      - working: true
+        agent: "testing"
+        comment: |
+          PASS — /api/signals/{whale,alpha,quant} verified end-to-end against external
+          EXPO_PUBLIC_BACKEND_URL with admin token:
+            ✓ limit=5 returns 200 + {signals: [...], count: int}; engine field matches
+              alias for every returned signal (alpha=5 signals, whale=0, quant=0 — empty
+              lists are explicitly OK per brief).
+            ✓ /signals/whale?limit=999 → 200 (clamped to 100, NOT 422).
+            ✓ /signals/whale?limit=0   → 200 (clamped to 1).
+          All 3 aliases conform to the documented response shape.
+
+phase_sports_ingest:
+  - task: "Sports market ingest — /api/markets now includes per-sport polymarket markets"
+    implemented: true
+    working: true
+    file: "backend/markets.py, backend/live_market.py (or equivalent ingest)"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: |
+          PASS — GET /api/markets (admin token) returns 87 quotes (>= 80 threshold).
+          Live ingest log confirms per-sport pulls every refresh:
+            "live_ingest_refreshed polymarket=87 kalshi=0 total=87
+             sports=nba=10 nfl=10 mlb=10 nhl=10 ncaaf=10 college-football=10"
+          Sports-looking polymarket title match: 32 quotes matched case-insensitive
+          substrings (spread:, vs., vs , points o/u, moneyline, knicks, lakers,
+          thunder, cavaliers, yankees, dodgers, patriots, chiefs, hurricanes,
+          canadiens). Samples:
+            - "spread: spurs (-1.5)"
+            - "thunder vs. spurs: o/u 215.5"
+            - "lol: dplus kia vs bnk fearx - game 2 winner"
+            - "game handicap: red (-1.5) vs furia esports (+1.5)"
+            - "valorant: 9z team vs krü blaze (bo3)"
+            - "set 1 winner: wu vs giron"
+          Far exceeds the >=5 requirement.
+
+phase_curated_wallet_seed:
+  - task: "Curated wallet seed reconciliation — 10 active + 7 retired"
+    implemented: true
+    working: true
+    file: "backend/server.py (seed_default_wallets), backend/whale_tracker.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: false
+    status_history:
+      - working: true
+        agent: "testing"
+        comment: |
+          PASS — Curated wallet seed reconciliation verified:
+            ✓ GET /api/whales/wallets returns exactly 10 active wallets.
+            ✓ All 10 have source=="admin" AND is_active==true.
+            ✓ All 10 expected labels present: tubeyou, Multicolored-Self, swisstony,
+              restart77, RN1, mooseborzoi, LaBradfordSmith22, bcda, VPenguin,
+              Whale-F705.
+            ✓ GET /api/whales/wallets?include_retired=true returns 17 total
+              (10 active + 7 retired).
+            ✓ Exactly 7 wallets with is_active==false.
+            ✓ All 7 expected retired labels present: Whale-2C53, Polywhale-9D7B,
+              RiskManager-F424, Atlas-A28E, Sentinel-FCAE, Ironclad-46F4, Specter-F99C.
+          Reconciliation logic confirmed idempotent — running twice does not duplicate
+          or re-activate retired entries.
+
+agent_communication:
+  - agent: "testing"
+    message: |
+      Verified the 3 NEW additions per the review brief. ALL 13/13 sub-checks PASS
+      (script: /app/new_additions_test.py).
+
+      1) Sports market ingest (/api/markets):
+         ✅ 87 quotes returned (>=80 ✓)
+         ✅ 32 polymarket quotes matched sports terms (>=5 ✓)
+         ✅ Backend log confirms per-sport pulls: nba=10 nfl=10 mlb=10 nhl=10
+            ncaaf=10 college-football=10 every 15s refresh.
+
+      2) Curated wallet seed (/api/whales/wallets):
+         ✅ 10 active wallets, all source=admin & is_active=true
+         ✅ All 10 expected labels present (tubeyou, Multicolored-Self,
+            swisstony, restart77, RN1, mooseborzoi, LaBradfordSmith22, bcda,
+            VPenguin, Whale-F705)
+         ✅ include_retired=true → 17 total, 7 retired
+         ✅ All 7 expected retired labels present (Whale-2C53, Polywhale-9D7B,
+            RiskManager-F424, Atlas-A28E, Sentinel-FCAE, Ironclad-46F4,
+            Specter-F99C)
+
+      3) Signal aliases (/api/signals/{whale,alpha,quant}):
+         ✅ All 3 endpoints return 200 + {signals, count} with correct engine match
+         ✅ limit=999 → 200 (clamped, NOT 422)
+         ✅ limit=0   → 200 (clamped to 1)
+
+      4) Regression: /app/backend_test.py — could not complete a full 28/28 because
+         the per-IP /auth/register rate-limit (5/hr) was already exhausted on this
+         ingress IP from prior runs; user_register hit 429 at test #3 (PhaseD user
+         registration is required by the suite). The brief explicitly calls this
+         out as an acceptable failure mode and not a real regression. No code
+         changes made. All new-addition functionality is empirically working.

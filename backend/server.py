@@ -793,6 +793,36 @@ async def micro_signals(user: dict = Depends(get_current_user)):
     return {"signals": signals}
 
 
+@api.get("/signals/whale")
+async def whale_signals(limit: int = 20, user: dict = Depends(get_current_user)):
+    """Convenience alias for `/signals?engine=whale` with a default limit."""
+    limit = max(1, min(100, limit))
+    async with _engine_cache_lock:
+        signals = [s for s in _engine_cache["signals"] if s["engine"] == "whale"]
+    signals.sort(key=lambda s: s["confidence"] * s["expected_edge"], reverse=True)
+    return {"signals": signals[:limit], "count": min(limit, len(signals))}
+
+
+@api.get("/signals/alpha")
+async def alpha_signals(limit: int = 20, user: dict = Depends(get_current_user)):
+    """Convenience alias for `/signals?engine=alpha`."""
+    limit = max(1, min(100, limit))
+    async with _engine_cache_lock:
+        signals = [s for s in _engine_cache["signals"] if s["engine"] == "alpha"]
+    signals.sort(key=lambda s: s["confidence"] * s["expected_edge"], reverse=True)
+    return {"signals": signals[:limit], "count": min(limit, len(signals))}
+
+
+@api.get("/signals/quant")
+async def quant_signals(limit: int = 20, user: dict = Depends(get_current_user)):
+    """Convenience alias for `/signals?engine=quant`."""
+    limit = max(1, min(100, limit))
+    async with _engine_cache_lock:
+        signals = [s for s in _engine_cache["signals"] if s["engine"] == "quant"]
+    signals.sort(key=lambda s: s["confidence"] * s["expected_edge"], reverse=True)
+    return {"signals": signals[:limit], "count": min(limit, len(signals))}
+
+
 # ---------- positions ----------
 def _serialize_position(p: dict) -> dict:
     return {
@@ -2170,10 +2200,18 @@ def _serialize_whale_entry(e: dict) -> dict:
 
 
 @api.get("/whales/wallets")
-async def list_tracked_wallets(user: dict = Depends(get_current_user)):
-    """List tracked wallets visible to caller: all admin-seeded + caller's own additions."""
+async def list_tracked_wallets(
+    include_retired: bool = False,
+    user: dict = Depends(get_current_user),
+):
+    """List tracked wallets visible to caller: all active admin-seeded + caller's own additions.
+
+    `include_retired=true` returns retired admin wallets too (for admin/audit views).
+    """
     user_id = str(user["_id"])
-    q = {"$or": [{"source": "admin"}, {"added_by_user_id": user_id}]}
+    q: dict = {"$or": [{"source": "admin"}, {"added_by_user_id": user_id}]}
+    if not include_retired:
+        q = {"$and": [q, {"is_active": True}]}
     rows = [_serialize_tracked_wallet(w) async for w in db.tracked_wallets.find(q).sort("created_at", 1)]
     return {"wallets": rows, "count": len(rows)}
 

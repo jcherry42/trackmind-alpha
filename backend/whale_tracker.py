@@ -55,26 +55,37 @@ state = WhaleTrackerState()
 
 
 # ---------- default seed list ----------
-# 8 publicly known top-volume / top-monthly-profit Polymarket wallets.
-# Sources: polymarket.com/leaderboard, bullpen.fi, polywhale tracker.
-# Admin can curate via POST /api/admin/whales/seed.
+# Top-volume + top-profit Polymarket wallets, scraped from the live leaderboard
+# (lb-api.polymarket.com) and individually verified to have BUY activity ≥ $500 USDC.
+# Updated 2026-05-22. Refreshable via POST /api/admin/whales/seed (future) or
+# manually by editing this list + restarting the backend.
+#
+# Note: addresses are case-preserved here for readability but stored lowercased
+# in Mongo (whale_tracker uses .lower() at insert time).
 DEFAULT_SEED_WALLETS: List[Dict[str, Any]] = [
+    # Highest sustained activity — confirmed $1M+ in last 20 BUY trades:
+    {"address": "0x1887879a1bda615e88f280b582514c7d54e2678a", "label": "tubeyou",
+     "note": "$13M 7d volume · always trading"},
     {"address": "0x492442EaB586F242B53bDa933fD5dE859c8A3782", "label": "Multicolored-Self",
-     "note": "Top-10 volume + monthly profit ($1.7M+)"},
-    {"address": "0x2a2C53bD278c04DA9962Fcf96490E17F3DfB9Bc1", "label": "Whale-2C53",
-     "note": "Top-10 volume + monthly profit ($1.6M+)"},
-    {"address": "0x9D7B0D11A8b1c6E6d6dE2C12bBB5e5DfA63d6e2f", "label": "Polywhale-9D7B",
-     "note": "Sports + crypto specialist"},
-    {"address": "0xF424F5C70bE7eb22A41eD0aB44F1d12dFc20DE07", "label": "RiskManager-F424",
-     "note": "Politics specialist"},
-    {"address": "0xa28E869DFb1cF63cf32C7c98b8c7d2EC8d65fDB7", "label": "Atlas-A28E",
-     "note": "Multi-category"},
-    {"address": "0xFcae00d6c4cfb3FFFc6e3A4B45f43A02f48eF8F2", "label": "Sentinel-FCAE",
-     "note": "High-volume sports"},
-    {"address": "0x46f4f00ad07c69b39f7c0d57fbabd0fbe6502505", "label": "Ironclad-46F4",
-     "note": "Crypto & elections"},
-    {"address": "0xF99cB3Da97e6B26C5BC7d2A0DAcE7Db1DD20FC7c", "label": "Specter-F99C",
-     "note": "NBA/NFL spreads"},
+     "note": "+$1.77M monthly profit · sports specialist"},
+    # Top-volume traders (mixed categories):
+    {"address": "0x204f72f35326db932158cba6adff0b9a1da95e14", "label": "swisstony",
+     "note": "$27M 7d volume · +$624k 7d profit"},
+    {"address": "0xe40ea00e74059c76c0035c919ef6b99c3e25a94d", "label": "restart77",
+     "note": "$25M 7d volume"},
+    {"address": "0x2005d16a84ceefa912d4e380cd32e7ff827875ea", "label": "RN1",
+     "note": "$20M 7d volume · politics + sports"},
+    {"address": "0x84cfffc3f16dcc353094de30d4a45226eccd2f63", "label": "mooseborzoi",
+     "note": "$18M 7d volume"},
+    # Top-profit traders:
+    {"address": "0x9495425feeb0c250accb89275c97587011b19a27", "label": "LaBradfordSmith22",
+     "note": "+$714k 7d profit · top monthly"},
+    {"address": "0xb45a797faa52b0fd8adc56d30382022b7b12192c", "label": "bcda",
+     "note": "+$557k 7d profit · high hit rate"},
+    {"address": "0xfbf3d501e88815464642d0e913f15379c3eeb218", "label": "VPenguin",
+     "note": "+$899k 7d profit · top profit ranker"},
+    {"address": "0xf705fa045201391d9632b7f3cde06a5e24453ca7", "label": "Whale-F705",
+     "note": "+$1.85M all-time crypto profit"},
 ]
 
 
@@ -98,32 +109,55 @@ async def ensure_indexes(db) -> None:
 
 
 async def seed_default_wallets(db) -> int:
-    """Insert the default seed list if `tracked_wallets` is empty. Idempotent."""
-    existing = await db.tracked_wallets.count_documents({})
-    if existing > 0:
-        return 0
+    """Reconcile `tracked_wallets` against DEFAULT_SEED_WALLETS.
+
+    Idempotent + refreshing:
+      - Upserts each wallet in DEFAULT_SEED_WALLETS (preserving entries_count etc).
+      - Marks any admin-source wallet NOT in the current default list as
+        is_active=False (so old curated wallets stop being polled but their
+        history isn't destroyed).
+      - User-added wallets (source="user") are never touched here.
+
+    Returns the number of admin wallets inserted-or-updated.
+    """
     now = datetime.now(timezone.utc)
-    docs = [
-        {
-            "address": w["address"].lower(),
-            "label": w["label"],
-            "note": w["note"],
-            "source": "admin",
-            "added_by_user_id": None,
-            "is_active": True,
-            "hit_rate_30d": None,
-            "total_volume_30d": None,
-            "last_polled_at": None,
-            "last_entry_at": None,
-            "entries_count": 0,
-            "created_at": now,
-        }
-        for w in DEFAULT_SEED_WALLETS
-    ]
-    if docs:
-        await db.tracked_wallets.insert_many(docs)
-    logger.info(f"whale_tracker: seeded {len(docs)} default wallets")
-    return len(docs)
+    new_addrs = {w["address"].lower() for w in DEFAULT_SEED_WALLETS}
+    touched = 0
+    for w in DEFAULT_SEED_WALLETS:
+        addr = w["address"].lower()
+        res = await db.tracked_wallets.update_one(
+            {"address": addr},
+            {
+                "$set": {
+                    "label": w["label"],
+                    "note": w["note"],
+                    "source": "admin",
+                    "is_active": True,
+                },
+                "$setOnInsert": {
+                    "address": addr,
+                    "added_by_user_id": None,
+                    "hit_rate_30d": None,
+                    "total_volume_30d": None,
+                    "last_polled_at": None,
+                    "last_entry_at": None,
+                    "entries_count": 0,
+                    "created_at": now,
+                },
+            },
+            upsert=True,
+        )
+        if res.upserted_id or res.modified_count:
+            touched += 1
+    # Deactivate retired admin wallets (no longer in the default list).
+    retired = await db.tracked_wallets.update_many(
+        {"source": "admin", "address": {"$nin": list(new_addrs)}},
+        {"$set": {"is_active": False, "retired_at": now}},
+    )
+    if retired.modified_count:
+        logger.info(f"whale_tracker: retired {retired.modified_count} admin wallets (off the new seed list)")
+    logger.info(f"whale_tracker: reconciled {touched}/{len(DEFAULT_SEED_WALLETS)} admin wallets (active)")
+    return touched
 
 
 # ---------- Polymarket data-api ----------
