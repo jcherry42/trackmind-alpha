@@ -1,13 +1,16 @@
-"""Alpha engine — narrative / sentiment / catalyst-driven repricing.
+"""Alpha engine — narrative / catalyst-driven repricing.
 
-Uses the Emergent Universal LLM key (Claude Sonnet 4.5) to score a curated
-catalyst feed against current market prices and emit signals when narrative
-strength diverges from price.
+STATUS: the catalyst feed below is SYNTHETIC (hand-written demo headlines).
+Synthetic news must never drive trades on real markets, so:
 
-The LLM is called with a tight, structured prompt and the response is parsed
-defensively. If the LLM is unavailable we fall back to a deterministic
-sentiment score derived from synthetic catalyst tags so the engine always
-emits something coherent.
+  * mock data mode  → runs on the demo catalog with the synthetic feed.
+  * live data mode  → emits NOTHING unless a real news source is wired in
+    (``ALPHA_NEWS_SOURCE``; not yet implemented) or the operator explicitly
+    sets ``ALPHA_ALLOW_SYNTHETIC=true`` for testing. ``status()`` reports why.
+
+Estimation: the narrative score in [-1, 1] *shifts* the market's own mid by at
+most ``ALPHA_MAX_SHIFT`` probability points (default 0.08). It does not replace
+the market price with an absolute guess. Edge is reported net of spread + fees.
 """
 
 from __future__ import annotations
@@ -18,10 +21,15 @@ import json
 import logging
 import os
 import random
+import re
 import time
 from typing import List
 
-from markets import market_store
+from fees import fee_per_contract
+from markets import ask_for, execution_refs, market_store
+
+ALPHA_MAX_SHIFT = float(os.environ.get("ALPHA_MAX_SHIFT", "0.08"))
+ALPHA_MIN_NET_EDGE = float(os.environ.get("ALPHA_MIN_NET_EDGE", "0.01"))
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +45,41 @@ CATALYSTS = [
     {"market_keywords": ["nvda"],        "headline": "NVDA channel checks signal record H100 demand", "sentiment": +0.75},
     {"market_keywords": ["recession"],   "headline": "ISM manufacturing breaks above 50, expansion territory", "sentiment": -0.6},
     {"market_keywords": ["oil", "wti"],  "headline": "OPEC+ extends voluntary cuts to year-end",      "sentiment": +0.55},
-    {"market_keywords": ["spx", "ath"],  "headline": "Mega-cap earnings tape comes in 80% beat rate", "sentiment": +0.6},
-    {"market_keywords": ["sb", "afc"],   "headline": "Star QB cleared from injury list ahead of playoffs", "sentiment": +0.5},
+    {"market_keywords": ["s&p", "spx"],  "headline": "Mega-cap earnings tape comes in 80% beat rate", "sentiment": +0.6},
+    {"market_keywords": ["super bowl", "afc"],   "headline": "Star QB cleared from injury list ahead of playoffs", "sentiment": +0.5},
     {"market_keywords": ["oscar"],       "headline": "Critics' guild awards split unexpectedly",       "sentiment": -0.3},
 ]
 
 
-def _match_catalysts(title: str, cid: str) -> List[dict]:
-    t = (title + " " + cid).lower()
-    return [c for c in CATALYSTS if any(k in t for k in c["market_keywords"])]
+_KW_PATTERNS = {
+    kw: re.compile(r"(?<![a-z0-9])" + re.escape(kw) + r"(?![a-z0-9])")
+    for c in CATALYSTS for kw in c["market_keywords"]
+}
+
+
+def _match_catalysts(title: str, cid: str = "") -> List[dict]:
+    """Whole-word keyword match (so "eth" doesn't match "Netherlands")."""
+    t = f"{title} {cid}".lower().replace("_", " ")
+    return [c for c in CATALYSTS if any(_KW_PATTERNS[k].search(t) for k in c["market_keywords"])]
+
+
+def _synthetic_allowed() -> bool:
+    if market_store.mode != "live":
+        return True
+    return os.environ.get("ALPHA_ALLOW_SYNTHETIC", "false").lower() in {"1", "true", "yes"}
+
+
+def status() -> dict:
+    allowed = _synthetic_allowed()
+    return {
+        "catalyst_source": "synthetic",
+        "data_mode": market_store.mode,
+        "active": allowed,
+        "reason": None if allowed else (
+            "Live market data is on but Alpha only has a synthetic demo news feed. "
+            "Connect a real news source (ALPHA_NEWS_SOURCE) to enable it."
+        ),
+    }
 
 
 def _heuristic_score(catalysts: List[dict]) -> float:
@@ -103,12 +137,14 @@ async def run_async(use_llm: bool = True, score_cache: dict | None = None, metri
     invocations to skip LLM calls when bucket hasn't advanced.  ``metrics`` is a simple counter dict.
     """
     signals: List[dict] = []
+    if not _synthetic_allowed():
+        return signals
     bucket = int(time.time() // 180)
     rng = random.Random(bucket)
 
     for q in market_store.all():
         if q.venue != "polymarket":
-            continue
+            continue  # one view per event; Kalshi duplicates are covered by Micro
         catalysts = _match_catalysts(q.title, q.canonical_id)
         if not catalysts:
             continue
@@ -142,37 +178,40 @@ async def run_async(use_llm: bool = True, score_cache: dict | None = None, metri
         if score is None:
             score = _heuristic_score(noisy)
 
-        # Implied probability vs market price reveals repricing edge.
-        implied = max(0.05, min(0.95, 0.5 + score * 0.35))
+        # The narrative nudges the market's own price; it doesn't replace it.
+        implied = max(0.02, min(0.98, q.yes + score * ALPHA_MAX_SHIFT))
         side = "YES" if implied > q.yes else "NO"
-        gap = abs(implied - (q.yes if side == "YES" else q.no))
-        if gap < 0.03:
+        fair = implied if side == "YES" else 1.0 - implied
+        price = ask_for(q, side)
+        net_gap = fair - price - fee_per_contract(q.venue, price)
+        if net_gap < ALPHA_MIN_NET_EDGE:
             continue
 
         confidence = round(max(0.0, min(0.95, 0.45 + abs(score) * 0.4)), 3)
-        expected_edge = round(gap * 0.5, 4)  # haircut for narrative noise
+        expected_edge = round(net_gap * 0.5, 4)  # haircut for narrative noise
         risk = round(max(0.015, 0.05 - abs(score) * 0.02), 4)
         liquidity = round(min(1.0, q.liquidity), 4)
-        size_hint = round(max(0.02, min(0.15, confidence * expected_edge * 3 + 0.04)), 4)
-        price = q.yes if side == "YES" else q.no
+        size_hint = round(max(0.02, min(0.15, confidence * expected_edge * 3 + 0.03)), 4)
 
         h = hashlib.sha1(f"{q.canonical_id}-{bucket}".encode()).hexdigest()[:8]
         signals.append({
             "engine": "alpha",
             "canonical_id": q.canonical_id,
-            "venue": q.venue,
             "market": q.title,
             "side": side,
-            "price": price,
+            "price": round(price, 4),
+            "mid": round(q.yes if side == "YES" else q.no, 4),
             "confidence": confidence,
             "expected_edge": expected_edge,
             "risk": risk,
             "liquidity": liquidity,
             "size_hint": size_hint,
-            "rationale": f"Narrative {score:+.2f} → implied {implied:.2f} vs market {q.yes:.2f}",
+            "rationale": f"Narrative {score:+.2f} → fair YES {implied:.2f} vs mid {q.yes:.2f} (ask {price:.2f} {side})",
             "catalysts": [c["headline"] for c in noisy],
+            "catalyst_source": "synthetic",
             "narrative_id": h,
             "cache_hit": cache_hit,
+            **execution_refs(q),
         })
     signals.sort(key=lambda s: s["confidence"] * s["expected_edge"], reverse=True)
     return signals[:8]

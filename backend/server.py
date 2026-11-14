@@ -2,10 +2,11 @@
 
 Single-file API surface that orchestrates:
   - JWT auth (cookies + Bearer fallback)
-  - Mock prediction-market data store + tick scheduler
+  - Market data store (mock demo catalog, or live Polymarket + Kalshi snapshots)
   - 4 trading-intelligence engines (Alpha / Quant / Whale / Micro)
   - Master allocator with risk constraints
-  - Paper broker with simulated fills, position lifecycle, settlement
+  - One execution pipeline (paper or live broker) with honest settlement:
+    paper positions settle at real market outcomes when data is live
   - Dashboard / signals / positions / analytics / controls endpoints
 """
 
@@ -20,11 +21,9 @@ load_dotenv(ROOT_DIR / ".env")
 import asyncio
 import logging
 import os
-import random
 import time
 import uuid
 from collections import defaultdict
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
@@ -32,17 +31,16 @@ import bcrypt
 import jwt
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from bson import ObjectId
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel
 
-from markets import market_store, quote_to_dict
-from allocator import RiskConfig, allocate
+from markets import ask_for, execution_refs, market_store, quote_to_dict
+from allocator import allocate
 from engines import alpha as alpha_engine, quant as quant_engine, whale as whale_engine, micro as micro_engine
 from broker import (
     get_broker,
-    resolve_broker_for_user,
     resolve_broker_for_user_async,
     is_live_configured,
     load_user_broker_creds,
@@ -51,7 +49,15 @@ from broker import (
 )
 from crypto import encrypt_payload, fingerprint_for
 from push import push_to_user as _push_to_user_async, DEFAULT_NOTIFY_PREFS
-from live_market import LIVE_INGEST_ENABLED, ingest_forever
+import live_market
+import paper_settlement
+from live_market import (
+    LIVE_INGEST_ENABLED,
+    fetch_kalshi_resolution,
+    fetch_polymarket_resolution,
+    ingest_forever,
+)
+from pairs import load_verified_pairs
 from exchange_settlement import (
     poll_loop as _polygon_poll_loop,
     settlement_status_snapshot,
@@ -66,24 +72,20 @@ from kalshi_ws import (
     my_stream_status as _kalshi_my_status,
 )
 from state import (
-    RateLimit,
     rl_login as _rl_login,
     rl_register as _rl_register,
-    rl_refresh as _rl_refresh,
     rl_trade as _rl_trade,
     rl_auto_deploy as _rl_auto_deploy,
     user_locks as _user_locks,
     engine_cache as _engine_cache,
     engine_cache_lock as _engine_cache_lock,
     alpha_cache as _alpha_cache,
-    alpha_cache_lock as _alpha_cache_lock,
     llm_metrics as _llm_metrics,
     master_signal_state as _master_signal_state,
 )
 from models import (
     RegisterIn,
     LoginIn,
-    TokenPair,
     TradeApproveIn,
     ControlsIn,
     LiveBrokerIn,
@@ -409,7 +411,7 @@ async def refresh_engines() -> None:
     # service). If the admin has exhausted quota, alpha falls back to cached scores.
     admin_user = await db.users.find_one({"role": "admin"})
     quota_ok = True
-    if admin_user:
+    if admin_user and alpha_engine.status()["active"]:
         # Best-effort *pre-consume* (up to 12 calls per refresh). If insufficient
         # credits, disable LLM for this tick and serve from cache / heuristic.
         quota_ok = await _check_and_consume_llm_quota(admin_user["_id"], amount=12)
@@ -481,75 +483,163 @@ async def refresh_engines() -> None:
     )
 
 
-async def settle_open_positions(user: dict) -> float:
-    """Tick existing open positions: mark-to-market, randomly settle ~7% per tick.
+PAPER_RESOLUTION_POLL_SEC = float(os.environ.get("PAPER_RESOLUTION_POLL_SEC", "120"))
 
-    Returns realized PnL delta added to bankroll. Serialised per user to prevent
-    double settlement across concurrent requests.
+
+async def _close_position(pos: dict, outcomes: Dict[int, str], resolution_source: str) -> Optional[dict]:
+    """Atomically close an open position at a resolved outcome and credit the user.
+
+    Cash credited = payout × contracts − fees (the stake was debited at entry);
+    realized PnL = cash credited − stake. Returns a settled-event dict, or None if
+    another caller closed it first.
+    """
+    payout, realized = paper_settlement.realized_pnl(pos, outcomes)
+    contracts = float(pos.get("contracts", 0.0))
+    cash_back = round(payout * contracts - float(pos.get("fees", 0.0)), 2)
+    res = await db.positions.update_one(
+        {"_id": pos["_id"], "status": "open"},
+        {"$set": {
+            "status": "closed",
+            "exit_price": payout,
+            "current_price": payout,
+            "unrealized_pnl": 0.0,
+            "realized_pnl": realized,
+            "resolution": {"outcomes": {str(k): v for k, v in outcomes.items()}, "source": resolution_source},
+            "settle_source": resolution_source,
+            "closed_at": datetime.now(timezone.utc),
+        }},
+    )
+    if res.modified_count != 1:
+        return None
+    user_oid = ObjectId(pos["user_id"]) if len(str(pos["user_id"])) == 24 else pos["user_id"]
+    await db.users.update_one(
+        {"_id": user_oid},
+        {"$inc": {"bankroll": cash_back, "realized_pnl_today": realized}},
+    )
+    await audit(str(pos["user_id"]), "position.settled", {
+        "position_id": str(pos["_id"]), "pnl": realized, "outcomes": outcomes, "source": resolution_source,
+    })
+    return {
+        "won": realized > 0,
+        "pnl": realized,
+        "market": pos.get("market", "—"),
+        "engine": pos.get("engine", "—"),
+        "position_id": str(pos["_id"]),
+    }
+
+
+async def settle_open_positions(user: dict) -> float:
+    """Mark the user's open positions to market (liquidation value at the bid).
+
+    Settlement:
+      * live positions — never here (venue watchers own them).
+      * paper positions on LIVE data — never here; `paper_resolution_loop`
+        settles them at the real market outcome.
+      * paper positions on MOCK data — simulated resolution with a time-based
+        hazard and an outcome drawn from the market's own price (no built-in edge).
+
+    Returns realized PnL settled during this call. Serialised per user.
     """
     user_id = str(user["_id"])
     lock = _user_locks[user_id]
     settled_events: List[dict] = []
+    realized_delta = 0.0
+    now = time.time()
     async with lock:
-        realized_delta = 0.0
         cursor = db.positions.find({"user_id": user_id, "status": "open"})
         async for pos in cursor:
-            # Mark to market using current quote
-            venue = pos.get("venue", "polymarket")
-            if pos.get("engine") == "micro":
-                current_value = 1.0  # arb pays 1.00 at settle modulo fees
-            else:
-                q = market_store.get(venue if venue != "cross" else "polymarket", pos["canonical_id"])
-                if not q:
-                    continue
-                current_value = q.yes if pos["side"] == "YES" else q.no
-            await db.positions.update_one(
-                {"_id": pos["_id"]},
-                {"$set": {"current_price": round(current_value, 4),
-                          "unrealized_pnl": round((current_value - pos["entry_price"]) * pos["contracts"], 2),
-                          "updated_at": datetime.now(timezone.utc)}},
-            )
-
-            # Randomly settle ~7% per tick (paper-mode quick cycles for engaging UX).
-            # Use atomic conditional update so concurrent callers can't double-settle.
-            if random.random() < 0.07:
-                win_prob = 0.5 + min(0.25, pos.get("expected_edge", 0.0) * 4)
-                won = random.random() < win_prob
-                payout = (1.0 if won else 0.0) if pos["engine"] != "micro" else (1.0 - pos.get("fees_pct", 0.01))
-                realized = round((payout - pos["entry_price"]) * pos["contracts"] - pos.get("fees", 0), 2)
-                settle_res = await db.positions.update_one(
-                    {"_id": pos["_id"], "status": "open"},
-                    {"$set": {
-                        "status": "closed",
-                        "exit_price": round(payout, 4),
-                        "realized_pnl": realized,
-                        "closed_at": datetime.now(timezone.utc),
-                    }},
+            value = paper_settlement.mark_value(pos, market_store.get)
+            upd: Dict[str, Any] = {"updated_at": datetime.now(timezone.utc)}
+            if value is not None:
+                upd["current_price"] = round(value, 4)
+                upd["unrealized_pnl"] = round(
+                    (value - float(pos["entry_price"])) * float(pos["contracts"]) - float(pos.get("fees", 0.0)), 2
                 )
-                if settle_res.modified_count == 1:
-                    realized_delta += realized
-                    await audit(user_id, "position.settled", {"position_id": str(pos["_id"]), "won": won, "pnl": realized})
-                    settled_events.append({
-                        "won": won,
-                        "pnl": realized,
-                        "market": pos.get("market", "—"),
-                        "engine": pos.get("engine", "—"),
-                        "position_id": str(pos["_id"]),
-                    })
+            last = pos.get("last_marked_at")
+            if last is None:
+                opened = pos.get("opened_at")
+                last = opened.replace(tzinfo=timezone.utc).timestamp() if isinstance(opened, datetime) else now
+            upd["last_marked_at"] = now
+            await db.positions.update_one({"_id": pos["_id"], "status": "open"}, {"$set": upd})
 
-        if realized_delta != 0:
-            await db.users.update_one(
-                {"_id": user["_id"]},
-                {"$inc": {"bankroll": realized_delta, "realized_pnl_today": realized_delta}},
-            )
+            if not paper_settlement.is_paper(pos):
+                continue
+            if (pos.get("data_source") or "mock") != "mock" or market_store.mode != "mock":
+                continue
+            outcomes = paper_settlement.mock_outcomes(pos, market_store.get, now - float(last))
+            if outcomes is None:
+                continue
+            ev = await _close_position(pos, outcomes, "simulated")
+            if ev:
+                realized_delta += ev["pnl"]
+                settled_events.append(ev)
 
-    # Fire B1 push notifications AFTER releasing the per-user lock to avoid extending
-    # the critical section by an outbound HTTP call. Best-effort: never raises.
     if settled_events:
         fresh = await db.users.find_one({"_id": user["_id"]})
         if fresh:
             asyncio.create_task(_fire_settled_pushes(fresh, settled_events))
-    return realized_delta
+    return round(realized_delta, 2)
+
+
+async def _fetch_leg_outcome(client, leg: dict) -> Optional[str]:
+    venue = leg.get("venue")
+    try:
+        if venue == "polymarket" and leg.get("polymarket_condition_id"):
+            return await fetch_polymarket_resolution(client, leg["polymarket_condition_id"])
+        if venue == "kalshi" and leg.get("kalshi_ticker"):
+            return await fetch_kalshi_resolution(client, leg["kalshi_ticker"])
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"resolution lookup failed for {venue}: {e}")
+    return None
+
+
+async def resolve_live_paper_positions() -> int:
+    """Settle paper positions on live markets that have actually resolved."""
+    import httpx  # local import keeps module import light for tests
+
+    now = time.time()
+    cache: Dict[tuple, Optional[str]] = {}
+    by_user: Dict[str, List[dict]] = defaultdict(list)
+    settled = 0
+    async with httpx.AsyncClient(headers={"User-Agent": "TRACKMIND/1.0"}) as client:
+        async for pos in db.positions.find({"status": "open", "broker": "paper", "data_source": "live"}):
+            legs = paper_settlement.legs_of(pos)
+            # Cheap pre-filter: every leg still listed live and before close ⇒ unresolved.
+            still_open = all(market_store.get(lg.get("venue"), lg.get("canonical_id")) is not None for lg in legs)
+            end_ts = pos.get("end_ts")
+            if still_open and (end_ts is None or float(end_ts) > now):
+                continue
+            outcomes: Dict[int, str] = {}
+            for i, leg in enumerate(legs):
+                key = (leg.get("venue"), leg.get("polymarket_condition_id") or leg.get("kalshi_ticker"))
+                if key not in cache:
+                    cache[key] = await _fetch_leg_outcome(client, leg)
+                if cache[key] is None:
+                    break
+                outcomes[i] = cache[key]
+            if len(outcomes) != len(legs):
+                continue
+            async with _user_locks[str(pos["user_id"])]:
+                ev = await _close_position(pos, outcomes, "venue_resolution")
+            if ev:
+                settled += 1
+                by_user[str(pos["user_id"])].append(ev)
+    for uid, events in by_user.items():
+        u = await db.users.find_one({"_id": ObjectId(uid)}) if len(uid) == 24 else None
+        if u:
+            asyncio.create_task(_fire_settled_pushes(u, events))
+    return settled
+
+
+async def paper_resolution_loop() -> None:
+    while True:
+        try:
+            n = await resolve_live_paper_positions()
+            if n:
+                logger.info(f"paper_resolution: settled {n} positions at real outcomes")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"paper_resolution loop error: {e}")
+        await asyncio.sleep(PAPER_RESOLUTION_POLL_SEC)
 
 
 async def _fire_settled_pushes(user: dict, events: List[dict]) -> None:
@@ -762,6 +852,9 @@ async def dashboard(user: dict = Depends(get_current_user)):
         "kill_switch": bool(user.get("kill_switch", False)),
         "engines_updated_at": engines_updated,
         "engine_status": engine_status,
+        # Where the numbers come from: "mock" = demo data, "live" = real venue quotes.
+        "data_mode": market_store.mode,
+        "alpha_status": alpha_engine.status(),
         "plan": {
             "deployed": plan["deployed"],
             "deployable_cash": plan["deployable_cash"],
@@ -846,6 +939,10 @@ def _serialize_position(p: dict) -> dict:
         "fill_id": p.get("fill_id"),
         "signal_id": p.get("signal_id"),
         "broker": p.get("broker"),
+        "order_status": p.get("order_status", "filled"),
+        "data_source": p.get("data_source", "mock"),
+        "settle_source": p.get("settle_source"),
+        "legs": p.get("legs"),
         "opened_at": p.get("opened_at", datetime.now(timezone.utc)).isoformat(),
         "closed_at": p["closed_at"].isoformat() if p.get("closed_at") else None,
     }
@@ -952,7 +1049,153 @@ async def _atomic_bankroll_debit(user_id_obj: ObjectId, amount: float) -> bool:
     return res.modified_count == 1
 
 
-# ---------- trade ----------
+# ---------- trade execution (single pipeline for approve / auto-deploy / mirror) ----------
+LIVE_BROKERS = ("polymarket", "kalshi")
+ALL_ENGINES = ("alpha", "quant", "whale", "micro")
+
+
+def _is_live_user(user: dict) -> bool:
+    return bool(user.get("live_mode")) and (user.get("live_broker") or "").lower() in LIVE_BROKERS
+
+
+def _live_daily_cap() -> float:
+    try:
+        return float(os.environ.get("MAX_DAILY_LIVE_NOTIONAL", "50"))
+    except ValueError:
+        return 50.0
+
+
+def _check_live_cap(user: dict, notional: float) -> None:
+    """Hard $ ceiling on live notional per UTC day (burn-in safety)."""
+    if not _is_live_user(user):
+        return
+    cap = _live_daily_cap()
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    spent = float(user.get("live_notional_today", 0.0)) if user.get("live_notional_today_date") == today_key else 0.0
+    if spent + notional > cap:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Live-trade daily cap reached: ${spent:.2f} + ${notional:.2f} > ${cap:.2f}. "
+                f"Raise MAX_DAILY_LIVE_NOTIONAL env to lift this."
+            ),
+        )
+
+
+async def _record_live_notional(user: dict, fill: dict) -> None:
+    today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    await db.users.update_one(
+        {"_id": user["_id"]},
+        [{"$set": {
+            "live_notional_today_date": today_key,
+            "live_notional_today": {
+                "$cond": [
+                    {"$eq": ["$live_notional_today_date", today_key]},
+                    {"$add": [{"$ifNull": ["$live_notional_today", 0]}, fill["notional"]]},
+                    fill["notional"],
+                ]
+            },
+        }}],
+    )
+    try:
+        from observability import live_orders_placed_total
+        live_orders_placed_total.labels(venue=fill["broker"], side=(fill.get("side") or "yes").lower()).inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _build_position_doc(user_id: str, sig: dict, fill: dict, signal_id: str, extra: Optional[dict] = None) -> dict:
+    now = datetime.now(timezone.utc)
+    doc = {
+        "user_id": user_id,
+        "engine": sig["engine"],
+        "canonical_id": sig["canonical_id"],
+        "market": sig["market"],
+        "venue": sig.get("venue", "paper"),
+        "side": sig["side"],
+        "entry_price": fill["price"],
+        "current_price": fill["price"],
+        "contracts": fill["contracts"],
+        "notional": fill["notional"],
+        "fees": fill["fees"],
+        "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
+        "expected_edge": sig["expected_edge"],
+        "confidence": sig["confidence"],
+        "status": "open",
+        # "filled" or "submitted" (resting limit order on a live venue).
+        "order_status": fill.get("order_status", "filled"),
+        "unrealized_pnl": 0.0,
+        "opened_at": now,
+        "last_marked_at": time.time(),
+        "broker": fill["broker"],
+        "fill_id": fill["id"],
+        "signal_id": signal_id,
+        # Routing / settlement identifiers.
+        "polymarket_condition_id": (sig.get("polymarket_condition_id") or "").lower() or None,
+        "polymarket_token_ids": sig.get("polymarket_token_ids") or [],
+        "kalshi_ticker": sig.get("kalshi_ticker"),
+        "outcomes": sig.get("outcomes"),
+        "end_ts": sig.get("end_ts"),
+        "data_source": sig.get("data_source") or market_store.mode,
+    }
+    if sig.get("side") == "ARB":
+        doc["legs"] = sig.get("legs") or []
+        doc["pair_polarity"] = sig.get("pair_polarity", "same")
+    if extra:
+        doc.update(extra)
+    return doc
+
+
+async def _execute_signal(
+    user: dict,
+    sig: dict,
+    notional: float,
+    *,
+    signal_id: str,
+    extra: Optional[dict] = None,
+) -> tuple[dict, dict]:
+    """Run every pre-trade guard, debit, route to the broker and persist.
+
+    Raises HTTPException on any refusal. Returns (position_doc, fill).
+    """
+    user_id = str(user["_id"])
+    if user.get("kill_switch"):
+        raise HTTPException(status_code=400, detail="Kill switch is active")
+    _check_daily_loss_circuit(user)
+    if sig["engine"] in user.get("paused_engines", []):
+        raise HTTPException(status_code=400, detail="Engine is paused")
+    live = _is_live_user(user)
+    if live and sig.get("executable_live") is False:
+        raise HTTPException(
+            status_code=400,
+            detail="This signal can't be executed live yet (cross-venue arbitrage needs two-venue execution). Paper only.",
+        )
+    if live and sig.get("data_source") == "mock":
+        raise HTTPException(status_code=400, detail="Refusing to send a live order for a demo (mock) market.")
+    _check_live_cap(user, notional)
+
+    ok = await _atomic_bankroll_debit(user["_id"], notional)
+    if not ok:
+        raise HTTPException(status_code=400, detail="Insufficient bankroll")
+    try:
+        broker = await resolve_broker_for_user_async(db, user)
+        fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
+    except Exception as e:
+        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": notional}})
+        raise HTTPException(status_code=502, detail=f"Broker error: {e}")
+
+    pos_doc = _build_position_doc(user_id, sig, fill, signal_id, extra)
+    res = await db.positions.insert_one(pos_doc)
+    pos_doc["_id"] = res.inserted_id
+    # Refund any difference if the broker sized below the debited amount.
+    diff = round(notional - float(fill["notional"]), 2)
+    if abs(diff) > 0.005:
+        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": diff}})
+    if fill.get("broker") in LIVE_BROKERS:
+        await _record_live_notional(user, fill)
+    return pos_doc, fill
+
+
 @api.post("/trade/approve")
 async def approve_trade(
     payload: TradeApproveIn,
@@ -977,26 +1220,20 @@ async def approve_trade(
             raise HTTPException(status_code=409, detail="Idempotent request in flight, try again")
 
     try:
+        # Account-level refusals first (clearer errors than "signal expired").
         if user.get("kill_switch"):
             raise HTTPException(status_code=400, detail="Kill switch is active")
-        # Daily loss circuit breaker — hard kill all trading once breached.
         _check_daily_loss_circuit(user)
-
         async with _engine_cache_lock:
             sig = _engine_cache["by_id"].get(payload.signal_id)
         if not sig:
             raise HTTPException(status_code=404, detail="Signal not found or expired")
-        if sig["engine"] in user.get("paused_engines", []):
-            raise HTTPException(status_code=400, detail="Engine is paused")
 
         bankroll = float(user["bankroll"])
-        # Caller-supplied notional must fit within bankroll — enforce strict guard BEFORE clamping
-        # so the user gets a real "insufficient bankroll" error instead of a silent 95% fill.
         if payload.notional is not None and float(payload.notional) > bankroll:
             raise HTTPException(status_code=400, detail="Insufficient bankroll")
         notional = payload.notional or round(min(bankroll * sig["size_hint"], bankroll * 0.15), 2)
         notional = max(1.0, min(notional, bankroll * 0.95))
-        # Per-trade size cap (user-configurable risk limit).
         capped = _clamp_notional_to_cap(user, notional)
         if payload.notional is not None and float(payload.notional) > capped + 0.005:
             _, mt_pct = _risk_limits_for(user)
@@ -1007,109 +1244,12 @@ async def approve_trade(
                     f"${capped:.2f} = {mt_pct*100:.2f}% of bankroll)."
                 ),
             )
-        notional = capped
-
-        # Live-trade safety cap (Day 2 hardening). Independent of the per-trade %
-        # cap: a hard $ ceiling on live-mode notional to prevent runaway spend
-        # while live trading is still being burned in. Paper trades are unaffected.
-        if user.get("live_mode") and (user.get("live_broker") or "").lower() in ("polymarket", "kalshi"):
-            try:
-                live_cap = float(os.environ.get("MAX_DAILY_LIVE_NOTIONAL", "50"))
-            except ValueError:
-                live_cap = 50.0
-            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            spent_today = float(user.get("live_notional_today", 0.0)) if user.get("live_notional_today_date") == today_key else 0.0
-            if spent_today + notional > live_cap:
-                # Refund the bankroll debit that has NOT yet happened — we haven't
-                # called _atomic_bankroll_debit yet.
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Live-trade daily cap reached: ${spent_today:.2f} + ${notional:.2f} > ${live_cap:.2f}. "
-                        f"Raise MAX_DAILY_LIVE_NOTIONAL env to lift this."
-                    ),
-                )
-
-        # Atomically debit bankroll BEFORE placing order; if debit fails, refuse.
-        ok = await _atomic_bankroll_debit(user["_id"], notional)
-        if not ok:
-            raise HTTPException(status_code=400, detail="Insufficient bankroll")
-
-        try:
-            broker = await resolve_broker_for_user_async(db, user)
-            fill = await broker.place_order(user_id=user_id, signal=sig, notional=notional)
-        except Exception as e:
-            # Refund on broker failure.
-            await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": notional}})
-            raise HTTPException(status_code=502, detail=f"Broker error: {e}")
-
-        pos_doc = {
-            "user_id": user_id,
-            "engine": sig["engine"],
-            "canonical_id": sig["canonical_id"],
-            "market": sig["market"],
-            "venue": sig.get("venue", "paper"),
-            "side": sig["side"],
-            "entry_price": fill["price"],
-            "current_price": fill["price"],
-            "contracts": fill["contracts"],
-            "notional": fill["notional"],
-            "fees": fill["fees"],
-            "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
-            "expected_edge": sig["expected_edge"],
-            "confidence": sig["confidence"],
-            "status": "open",
-            "unrealized_pnl": 0.0,
-            "opened_at": datetime.now(timezone.utc),
-            "broker": fill["broker"],
-            "fill_id": fill["id"],
-            "signal_id": payload.signal_id,
-            # Phase A2 (Day 2): condition_id captured at order time so the
-            # Polygon settlement watcher can match real on-chain payouts back to
-            # this position. None for paper trades; populated for Polymarket live.
-            "polymarket_condition_id": (sig.get("polymarket_condition_id") or "").lower() or None,
-            "kalshi_ticker": sig.get("kalshi_ticker"),
-        }
-        res = await db.positions.insert_one(pos_doc)
-        # Track live-mode daily notional for the per-day safety cap.
-        if fill.get("broker") in ("polymarket", "kalshi"):
-            today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            await db.users.update_one(
-                {"_id": user["_id"]},
-                [{"$set": {
-                    "live_notional_today_date": today_key,
-                    "live_notional_today": {
-                        "$cond": [
-                            {"$eq": ["$live_notional_today_date", today_key]},
-                            {"$add": [{"$ifNull": ["$live_notional_today", 0]}, fill["notional"]]},
-                            fill["notional"],
-                        ]
-                    },
-                }}],
-            )
-            # P2 observability counter
-            try:
-                from observability import live_orders_placed_total
-                live_orders_placed_total.labels(
-                    venue=fill["broker"], side=(sig.get("side") or "yes").lower()
-                ).inc()
-            except Exception:  # noqa: BLE001
-                pass
-        # Apply difference if broker sized slightly differently than the debited amount.
-        if abs(fill["notional"] - notional) > 0.005:
-            diff = notional - fill["notional"]  # positive = refund
-            if diff != 0:
-                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": diff}})
+        pos_doc, fill = await _execute_signal(user, sig, capped, signal_id=payload.signal_id)
         await audit(user_id, "trade.approve", {"signal_id": payload.signal_id, "notional": fill["notional"]})
-        pos_doc["_id"] = res.inserted_id
         response = {"position": _serialize_position(pos_doc), "fill": fill}
         if ikey:
             await _finalize_idempotency(ikey, user_id, response)
         return response
-    except HTTPException:
-        if ikey:
-            await _abort_idempotency(ikey, user_id)
-        raise
     except Exception:
         if ikey:
             await _abort_idempotency(ikey, user_id)
@@ -1127,7 +1267,6 @@ async def auto_deploy(
     user = await db.users.find_one({"_id": user["_id"]})
     user_id = str(user["_id"])
 
-    # ---- Idempotency: claim the key before doing any work. ----
     ikey = idempotency_key or ""
     if ikey:
         is_owner, prior = await _acquire_idempotency(ikey, user_id)
@@ -1145,75 +1284,33 @@ async def auto_deploy(
         _check_daily_loss_circuit(user)
         async with _engine_cache_lock:
             signals = list(_engine_cache["signals"])
+        if _is_live_user(user):
+            signals = [s for s in signals if s.get("executable_live") is not False and s.get("data_source") != "mock"]
 
         realized_today = float(user.get("realized_pnl_today", 0.0))
         starting = float(user.get("starting_bankroll", INITIAL_BANKROLL))
         pnl_pct = round(realized_today / max(starting, 1.0), 4)
+        plan = allocate(signals, float(user["bankroll"]), pnl_pct, set(user.get("paused_engines", [])))
 
-        paused = set(user.get("paused_engines", []))
-        plan = allocate(signals, float(user["bankroll"]), pnl_pct, paused)
-
-        deployed = []
+        deployed, skipped = [], []
         for order in plan["orders"][:3]:
-            # Re-clamp to per-trade cap (the allocator doesn't know user prefs).
-            order["notional"] = _clamp_notional_to_cap(user, float(order["notional"]))
-            ok = await _atomic_bankroll_debit(user["_id"], order["notional"])
-            if not ok:
-                break  # out of bankroll; stop deploying more
+            fresh = await db.users.find_one({"_id": user["_id"]})  # live cap / bankroll move per order
+            notional = _clamp_notional_to_cap(fresh, float(order["notional"]))
             try:
-                broker = await resolve_broker_for_user_async(db, user)
-                fill = await broker.place_order(user_id=user_id, signal=order, notional=order["notional"])
-            except Exception as e:
-                await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": order["notional"]}})
-                logger.warning(f"auto_deploy broker error: {e}")
+                pos_doc, _fill = await _execute_signal(fresh, order, notional, signal_id=order["id"])
+            except HTTPException as e:
+                skipped.append({"signal_id": order["id"], "reason": e.detail})
+                if "Insufficient bankroll" in str(e.detail) or "daily cap" in str(e.detail):
+                    break
                 continue
-
-            pos_doc = {
-                "user_id": user_id,
-                "engine": order["engine"],
-                "canonical_id": order["canonical_id"],
-                "market": order["market"],
-                "venue": order.get("venue", "paper"),
-                "side": order["side"],
-                "entry_price": fill["price"],
-                "current_price": fill["price"],
-                "contracts": fill["contracts"],
-                "notional": fill["notional"],
-                "fees": fill["fees"],
-                "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
-                "expected_edge": order["expected_edge"],
-                "confidence": order["confidence"],
-                "status": "open",
-                "unrealized_pnl": 0.0,
-                "opened_at": datetime.now(timezone.utc),
-                "broker": fill["broker"],
-                "fill_id": fill["id"],
-                "signal_id": order["id"],
-            }
-            res = await db.positions.insert_one(pos_doc)
-            pos_doc["_id"] = res.inserted_id
             deployed.append(_serialize_position(pos_doc))
-            # P2 observability — count live orders placed via auto-deploy.
-            if fill.get("broker") in ("polymarket", "kalshi"):
-                try:
-                    from observability import live_orders_placed_total
-                    live_orders_placed_total.labels(
-                        venue=fill["broker"], side=(order.get("side") or "yes").lower()
-                    ).inc()
-                except Exception:  # noqa: BLE001
-                    pass
-        await audit(user_id, "trade.auto_deploy", {"count": len(deployed)})
-        response = {"deployed": deployed, "plan": {"orders_count": len(plan["orders"])}}
-        # B2 push: notify user when auto-deploy actually placed orders.
+        await audit(user_id, "trade.auto_deploy", {"count": len(deployed), "skipped": len(skipped)})
+        response = {"deployed": deployed, "skipped": skipped, "plan": {"orders_count": len(plan["orders"])}}
         if deployed:
             asyncio.create_task(_fire_auto_deploy_push(user, deployed))
         if ikey:
             await _finalize_idempotency(ikey, user_id, response)
         return response
-    except HTTPException:
-        if ikey:
-            await _abort_idempotency(ikey, user_id)
-        raise
     except Exception:
         if ikey:
             await _abort_idempotency(ikey, user_id)
@@ -1423,7 +1520,27 @@ async def reset_account(user: dict = Depends(get_current_user)):
 # ---------- markets debug ----------
 @api.get("/markets")
 async def markets(user: dict = Depends(get_current_user)):
-    return {"quotes": [quote_to_dict(q) for q in market_store.all()]}
+    return {"status": market_store.status(), "quotes": [quote_to_dict(q) for q in market_store.all()]}
+
+
+@api.get("/markets/pairs")
+async def market_pairs(user: dict = Depends(get_current_user)):
+    """Verified cross-venue pairs (traded by Micro) + unverified candidates for review.
+
+    Candidates are title-similarity matches only. They are NEVER traded; an operator
+    must check both venues' resolution rules and add the pair to market_pairs.json.
+    """
+    active = [
+        {"pair_id": pid, "polarity": pol, "polymarket": p.title, "kalshi": k.title,
+         "polymarket_condition_id": p.polymarket_condition_id, "kalshi_ticker": k.kalshi_ticker}
+        for p, k, pid, pol in market_store.pairs()
+    ]
+    return {
+        "data_mode": market_store.mode,
+        "verified_file_rows": len(load_verified_pairs()),
+        "active_pairs": active,
+        "candidates": live_market.pair_candidates,
+    }
 
 
 @api.get("/health")
@@ -2297,9 +2414,9 @@ async def whale_mirror_trade(
     loss circuit, live-trade safety cap). The caller's `max_trade_pct` is enforced;
     if `notional` is omitted, we size to that cap automatically.
 
-    The mirror only works if we can map the whale's `conditionId` to a currently
-    LIVE Polymarket market — i.e. the entry's `canonical_id` is not null. Otherwise
-    400 with detail explaining the market is unavailable.
+    The mirror only works if the whale's `conditionId` is a market currently in
+    our store. Otherwise 400 with detail explaining the market is unavailable.
+    Kill switch, daily-loss circuit and live caps all apply (shared pipeline).
     """
     user = await db.users.find_one({"_id": user["_id"]})
     user_id = str(user["_id"])
@@ -2313,28 +2430,23 @@ async def whale_mirror_trade(
     entry = await db.whale_entries.find_one({"_id": eid})
     if not entry:
         raise HTTPException(status_code=404, detail="Whale entry not found")
-    cid = entry.get("canonical_id")
-    if not cid:
-        raise HTTPException(
-            status_code=400,
-            detail="Cannot mirror — Polymarket conditionId is not in our live market set right now.",
-        )
-    quote = market_store.get("polymarket", cid)
+    cond = (entry.get("condition_id") or "").lower()
+    quote = market_store.find_by_condition_id(cond) if cond else None
     if not quote:
         raise HTTPException(
             status_code=400,
-            detail="Cannot mirror — market is no longer live or has settled.",
+            detail="Cannot mirror — this market isn't in our live market set (not ingested, or already settled).",
         )
-    side = entry.get("side") or "YES"
-    price = quote.yes if side == "YES" else quote.no
+    # NB: entry["side"] is the trade direction (BUY/SELL), not the outcome.
+    side = whale_engine._outcome_to_side(entry.get("outcome"), entry.get("outcome_index"))  # noqa: SLF001
+    price = ask_for(quote, side)
 
-    # Build a synthetic signal mirroring the whale entry.
     bankroll = float(user.get("bankroll", 0.0))
-    mt_pct = max(0.0001, min(0.20, float(user.get("max_trade_pct") or 0.02)))
+    _, mt_pct = _risk_limits_for(user)
     max_dollar = bankroll * mt_pct
     requested = payload.notional if payload.notional is not None else max_dollar
     requested = max(1.0, float(requested))
-    if requested > max_dollar:
+    if requested > max_dollar + 0.005:
         raise HTTPException(
             status_code=400,
             detail=(
@@ -2342,89 +2454,32 @@ async def whale_mirror_trade(
                 f"${max_dollar:.2f} ({mt_pct*100:.2f}% of bankroll)."
             ),
         )
-    # Daily-loss circuit (reuse same guard as approve_trade).
-    _check_daily_loss_circuit(user)
-    # Atomic debit.
-    ok = await _atomic_bankroll_debit(user["_id"], requested)
-    if not ok:
-        raise HTTPException(status_code=400, detail="Insufficient bankroll")
-    # Build the signal + execute via the active broker.
     sig = {
-        "id": f"mirror_{entry['transaction_hash'][:14]}_{int(time.time())}",
+        "id": f"mirror_{(entry.get('transaction_hash') or '')[:14]}_{int(time.time())}",
         "engine": "whale",
-        "canonical_id": cid,
-        "venue": "polymarket",
+        "canonical_id": quote.canonical_id,
         "market": quote.title,
         "side": side,
-        "price": price,
-        "confidence": 0.80,
-        "expected_edge": 0.05,
+        "price": round(price, 4),
+        "confidence": 0.0,      # a mirror is a manual decision, not a model output
+        "expected_edge": 0.0,
         "risk": 0.03,
         "liquidity": float(quote.liquidity),
-        "size_hint": 0.05,
+        "size_hint": mt_pct,
         "rationale": (
-            f"Mirror of {entry.get('wallet_label') or entry.get('wallet_address', '')[:10]} · "
+            f"Mirror of {entry.get('wallet_label') or (entry.get('wallet_address') or '')[:10]} · "
             f"${float(entry.get('usdc_size') or 0):,.0f} @ {entry.get('price')}"
         ),
-        "polymarket_condition_id": (entry.get("condition_id") or "").lower() or None,
+        **execution_refs(quote),
     }
-    try:
-        broker = await resolve_broker_for_user_async(db, user)
-        fill = await broker.place_order(user_id=user_id, signal=sig, notional=requested)
-    except Exception as e:
-        await db.users.update_one({"_id": user["_id"]}, {"$inc": {"bankroll": requested}})
-        raise HTTPException(status_code=502, detail=f"Broker error: {e}")
-    pos_doc = {
-        "user_id": user_id,
-        "engine": "whale",
-        "canonical_id": cid,
-        "market": quote.title,
-        "venue": "polymarket",
-        "side": side,
-        "entry_price": fill["price"],
-        "current_price": fill["price"],
-        "contracts": fill["contracts"],
-        "notional": fill["notional"],
-        "fees": fill["fees"],
-        "fees_pct": fill["fees"] / max(1.0, fill["notional"]),
-        "expected_edge": sig["expected_edge"],
-        "confidence": sig["confidence"],
-        "status": "open",
-        "unrealized_pnl": 0.0,
-        "opened_at": datetime.now(timezone.utc),
-        "broker": fill["broker"],
-        "fill_id": fill["id"],
-        "signal_id": sig["id"],
-        "polymarket_condition_id": sig["polymarket_condition_id"],
-        "mirror_of_entry_id": str(entry["_id"]),
-        "mirror_of_tx": entry.get("transaction_hash"),
-        "mirror_of_wallet": entry.get("wallet_address"),
-    }
-    res = await db.positions.insert_one(pos_doc)
-    pos_doc["_id"] = res.inserted_id
-    # Track live notional + P2 metric.
-    if fill.get("broker") in ("polymarket", "kalshi"):
-        today_key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        await db.users.update_one(
-            {"_id": user["_id"]},
-            [{"$set": {
-                "live_notional_today_date": today_key,
-                "live_notional_today": {
-                    "$cond": [
-                        {"$eq": ["$live_notional_today_date", today_key]},
-                        {"$add": [{"$ifNull": ["$live_notional_today", 0]}, fill["notional"]]},
-                        fill["notional"],
-                    ]
-                },
-            }}],
-        )
-        try:
-            from observability import live_orders_placed_total
-            live_orders_placed_total.labels(
-                venue=fill["broker"], side=side.lower()
-            ).inc()
-        except Exception:  # noqa: BLE001
-            pass
+    pos_doc, fill = await _execute_signal(
+        user, sig, requested, signal_id=sig["id"],
+        extra={
+            "mirror_of_entry_id": str(entry["_id"]),
+            "mirror_of_tx": entry.get("transaction_hash"),
+            "mirror_of_wallet": entry.get("wallet_address"),
+        },
+    )
     await audit(user_id, "whale.mirror", {
         "entry_id": str(entry["_id"]),
         "wallet": entry.get("wallet_address"),
@@ -2596,6 +2651,10 @@ async def on_startup():
     if LIVE_INGEST_ENABLED:
         asyncio.create_task(ingest_forever())
         logger.info("live ingest task scheduled")
+        # Paper positions on live markets settle at the real outcome.
+        await db.positions.create_index([("status", 1), ("broker", 1), ("data_source", 1)])
+        asyncio.create_task(paper_resolution_loop())
+        logger.info("paper resolution loop scheduled")
 
     # Polygon settlement watcher — only starts if POLYGON_RPC_URL is set.
     # No-ops gracefully (logs a warning + returns) if the env var is missing.

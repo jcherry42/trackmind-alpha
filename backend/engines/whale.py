@@ -27,7 +27,8 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from markets import market_store
+from fees import fee_per_contract
+from markets import ask_for, execution_refs, half_spread, market_store
 
 logger = logging.getLogger("trackmind.engine.whale")
 
@@ -82,14 +83,16 @@ async def run_async(db: Any = None) -> List[dict]:
         return []
 
     since = datetime.now(timezone.utc) - timedelta(minutes=WHALE_LOOKBACK_MIN)
+    # Group on the Polymarket conditionId (stable), not our canonical_id, so entries
+    # ingested before their market entered the live store still count.
     cursor = db.whale_entries.find(
-        {"observed_at": {"$gte": since}, "canonical_id": {"$ne": None}}
+        {"observed_at": {"$gte": since}, "condition_id": {"$nin": [None, ""]}}
     ).sort("ts", -1)
 
     # Aggregate per canonical_id (in-memory — recent entries volume is bounded).
     groups: Dict[str, Dict[str, Any]] = {}
     async for e in cursor:
-        cid = e.get("canonical_id")
+        cid = (e.get("condition_id") or "").lower()
         if not cid:
             continue
         side = _outcome_to_side(e.get("outcome"), e.get("outcome_index"))
@@ -137,16 +140,21 @@ async def run_async(db: Any = None) -> List[dict]:
         recency_sec = max(0.0, now - g["ts_newest"])
 
         # Pull live market for price + venue context. Skip if not (or no longer) live.
-        quote = market_store.get("polymarket", cid)
+        quote = market_store.find_by_condition_id(cid)
         if quote is None:
             continue
-        price = quote.yes if majority_side == "YES" else quote.no
+        price = ask_for(quote, majority_side)
+        trade_cost = half_spread(quote, majority_side) + fee_per_contract(quote.venue, price)
         confidence = _confidence(n_wallets, g["notional"], agreement, recency_sec)
         # Edge: assume whales are right with probability hit_rate. With public top
         # wallets averaging ~60% hit, a $5k+ inflow on YES at 0.55 gives a real
         # but modest edge. Conservative formula.
         base_edge = 0.04 + 0.02 * agreement + 0.01 * min(2.0, n_wallets / 2.0)
-        expected_edge = round(base_edge * (0.5 + agreement / 2.0), 4)
+        # NOTE: uncalibrated prior. Phase 2 replaces this with each wallet's
+        # measured hit rate / ROI on resolved markets.
+        expected_edge = round(base_edge * (0.5 + agreement / 2.0) - trade_cost, 4)
+        if expected_edge <= 0:
+            continue
         risk = round(max(0.015, 0.05 - expected_edge * 0.6), 4)
         liquidity = round(min(1.0, quote.liquidity), 4)
         size_hint = round(max(0.03, min(0.15, confidence * expected_edge * 3 + 0.05)), 4)
@@ -160,11 +168,10 @@ async def run_async(db: Any = None) -> List[dict]:
 
         signals.append({
             "engine": "whale",
-            "canonical_id": cid,
-            "venue": quote.venue,
+            "canonical_id": quote.canonical_id,
             "market": quote.title,
             "side": majority_side,
-            "price": price,
+            "price": round(price, 4),
             "confidence": confidence,
             "expected_edge": expected_edge,
             "risk": risk,
@@ -177,7 +184,8 @@ async def run_async(db: Any = None) -> List[dict]:
             ),
             # Surfaced in the signal card UI:
             "wallets": rationale_wallets,
-            "polymarket_condition_id": (getattr(quote, "polymarket_condition_id", "") or "").lower() or None,
+            "edge_calibrated": False,
+            **execution_refs(quote),
         })
 
     # Sort by composite score, take top-K.

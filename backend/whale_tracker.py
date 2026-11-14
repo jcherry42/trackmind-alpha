@@ -204,13 +204,9 @@ async def _resolve_canonical_id(db, condition_id: str) -> Optional[str]:
     """
     try:
         from markets import market_store
-        cond_lower = (condition_id or "").lower()
-        for q in market_store.all():
-            if q.venue != "polymarket":
-                continue
-            poly_cond = (getattr(q, "polymarket_condition_id", "") or "").lower()
-            if poly_cond and poly_cond == cond_lower:
-                return q.canonical_id
+        q = market_store.find_by_condition_id(condition_id)
+        if q is not None:
+            return q.canonical_id
     except Exception:  # noqa: BLE001
         pass
     return None

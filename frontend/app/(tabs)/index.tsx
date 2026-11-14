@@ -35,6 +35,8 @@ type DashboardData = {
   unrealized_pnl: number;
   open_positions: number;
   mode: "live" | "paper";
+  data_mode?: "mock" | "live";
+  alpha_status?: { active: boolean; reason: string | null };
   kill_switch: boolean;
   engines_updated_at: number;
   engine_status: EngineStatus[];
@@ -112,6 +114,17 @@ export default function Dashboard() {
             <Text style={styles.modeChip}>
               {killed ? "KILLED" : data?.mode === "live" ? "LIVE" : "PAPER"}
             </Text>
+            {data?.data_mode ? (
+              <Text
+                testID="data-mode-chip"
+                style={[
+                  styles.modeChip,
+                  data.data_mode === "mock" && { color: colors.negative, borderColor: colors.negative },
+                ]}
+              >
+                {data.data_mode === "mock" ? "DEMO DATA" : "LIVE DATA"}
+              </Text>
+            ) : null}
           </View>
           <View style={styles.topActions}>
             <IconBtn
@@ -155,6 +168,12 @@ export default function Dashboard() {
           </View>
         </View>
         </FadeSlideIn>
+
+        {data?.alpha_status && !data.alpha_status.active && data.alpha_status.reason ? (
+          <Text testID="alpha-status-note" style={styles.engineNote}>
+            ALPHA OFF · {data.alpha_status.reason}
+          </Text>
+        ) : null}
 
         {/* Engines — minimalist horizontal list */}
         <FadeSlideIn delay={180}>
@@ -372,6 +391,12 @@ const styles = StyleSheet.create({
   markRow: { flexDirection: "row", alignItems: "center", gap: 10 },
   markDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: colors.textPrimary },
   brand: { color: colors.textPrimary, fontSize: 14, fontWeight: "800", letterSpacing: 3 },
+  engineNote: {
+    color: colors.textTertiary,
+    fontSize: 11,
+    lineHeight: 16,
+    marginTop: space.md,
+  },
   modeChip: {
     color: colors.textTertiary,
     fontSize: 9,
