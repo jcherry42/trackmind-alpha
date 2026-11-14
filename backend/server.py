@@ -517,7 +517,9 @@ async def _close_position(pos: dict, outcomes: Dict[int, str], resolution_source
         {"$inc": {"bankroll": cash_back, "realized_pnl_today": realized}},
     )
     await audit(str(pos["user_id"]), "position.settled", {
-        "position_id": str(pos["_id"]), "pnl": realized, "outcomes": outcomes, "source": resolution_source,
+        "position_id": str(pos["_id"]), "pnl": realized,
+        "outcomes": {str(k): v for k, v in outcomes.items()},  # BSON keys must be strings
+        "source": resolution_source,
     })
     return {
         "won": realized > 0,
