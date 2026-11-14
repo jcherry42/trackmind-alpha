@@ -209,6 +209,7 @@ class KalshiWsClient:
             {"$set": {
                 "current_price": round((price_cents or 0) / 100.0, 4),
                 "updated_at": datetime.now(timezone.utc),
+                **({"order_status": "filled"} if action == "buy" else {}),
             }},
         )
         if pos and action == "sell":
@@ -235,7 +236,8 @@ class KalshiWsClient:
                 user_oid = self.user_id
             await self.db.users.update_one(
                 {"_id": user_oid},
-                {"$inc": {"bankroll": realized, "realized_pnl_today": realized}},
+                # Cash back is the sale proceeds net of fees; the stake was debited at entry.
+                {"$inc": {"bankroll": round(payout - fees, 2), "realized_pnl_today": realized}},
             )
             logger.info(
                 f"kalshi_ws[{self.user_id}] settled position {pos['_id']} → pnl=${realized:.2f}"

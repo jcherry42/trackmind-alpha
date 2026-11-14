@@ -92,6 +92,7 @@ prometheus_client==0.25.0
 propcache==0.4.1
 proto-plus==1.27.2
 protobuf==5.29.6
+py-clob-client>=0.20.0  # Polymarket CLOB order signing (live trading)
 pyasn1==0.6.3
 pyasn1_modules==0.4.2
 pycodestyle==2.14.0

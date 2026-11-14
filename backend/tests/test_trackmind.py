@@ -156,8 +156,10 @@ class TestSignals:
         assert "signals" in d
         for s in d["signals"]:
             assert s["engine"] == "micro"
-            assert "legs" in s
-            assert "yes" in s["legs"] and "no" in s["legs"]
+            assert isinstance(s["legs"], list) and len(s["legs"]) == 2
+            sides = {leg["side"] for leg in s["legs"]}
+            assert sides <= {"YES", "NO"}
+            assert s["executable_live"] is False
 
 
 # --------------- module: trade & positions ----------------

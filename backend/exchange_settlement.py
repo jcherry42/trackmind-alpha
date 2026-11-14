@@ -337,7 +337,8 @@ async def _settle_polymarket_position(db, event: Dict[str, Any], user_id: str) -
         user_oid = user_id
     await db.users.update_one(
         {"_id": user_oid},
-        {"$inc": {"bankroll": realized, "realized_pnl_today": realized}},
+        # Cash back is the redemption payout net of fees; the stake was debited at entry.
+        {"$inc": {"bankroll": round(payout_usdc - fees, 2), "realized_pnl_today": realized}},
     )
     logger.info(
         f"settlement: position {open_pos['_id']} closed via on-chain PayoutRedemption "

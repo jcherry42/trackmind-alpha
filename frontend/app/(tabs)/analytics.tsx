@@ -13,6 +13,7 @@ import { Sparkline } from "../../components/Sparkline";
 import { MetricText, formatPct, formatUsd, pnlColor } from "../../lib/format";
 import { colors, engineColor, space, type as typo } from "../../lib/theme";
 import { FadeSlideIn } from "../../components/Animated";
+import { EngineScorecard } from "../../components/EngineScorecard";
 
 type Analytics = {
   trades_total: number;
@@ -155,6 +156,10 @@ export default function AnalyticsScreen() {
             );
           })}
         </View>
+        </FadeSlideIn>
+
+        <FadeSlideIn delay={360}>
+          <EngineScorecard />
         </FadeSlideIn>
 
         <View style={{ height: space.xl }} />

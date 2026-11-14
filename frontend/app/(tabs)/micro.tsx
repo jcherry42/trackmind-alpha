@@ -24,11 +24,9 @@ type MicroSig = {
   liquidity: number;
   size_hint: number;
   rationale: string;
-  legs: {
-    yes: { venue: string; price: number; market: string };
-    no: { venue: string; price: number; market: string };
-    fees: number;
-  };
+  legs: { venue: string; side: "YES" | "NO"; price: number; market: string }[];
+  fees_per_contract: number;
+  data_source?: "mock" | "live";
 };
 
 export default function MicroMode() {
@@ -71,7 +69,7 @@ export default function MicroMode() {
       <View style={styles.header}>
         <View>
           <Text style={styles.title}>Micro</Text>
-          <Text style={styles.tagline}>Cross-venue YES + NO &lt; $1.00</Text>
+          <Text style={styles.tagline}>Verified cross-venue pairs · asks + fees &lt; $1.00</Text>
         </View>
         <Text style={styles.count}>{signals.length}</Text>
       </View>
@@ -84,7 +82,10 @@ export default function MicroMode() {
           <RefreshControl tintColor={colors.textTertiary} refreshing={loading} onRefresh={load} />
         }
         ListEmptyComponent={
-          <Text style={styles.empty}>No arbitrage opportunities right now.</Text>
+          <Text style={styles.empty}>
+            No arbitrage on verified pairs right now. Pairs must be reviewed and added to
+            market_pairs.json before they are scanned.
+          </Text>
         }
         renderItem={({ item, index }) => (
           <FadeSlideIn delay={Math.min(index, 5) * 60} distance={10}>
@@ -97,7 +98,8 @@ export default function MicroMode() {
 }
 
 function ArbCard({ sig, onExecute }: { sig: MicroSig; onExecute: () => void }) {
-  const cost = sig.legs.yes.price + sig.legs.no.price;
+  const [a, b] = sig.legs;
+  const cost = a.price + b.price;
   const edge = sig.expected_edge;
   return (
     <View testID={`arb-${sig.id}`} style={styles.card}>
@@ -106,29 +108,29 @@ function ArbCard({ sig, onExecute }: { sig: MicroSig; onExecute: () => void }) {
         <Text style={styles.heroLabel}>Net Edge</Text>
         <Text style={styles.heroEdge}>+{(edge * 100).toFixed(2)}%</Text>
         <Text style={styles.heroSub}>
-          YES {sig.legs.yes.price.toFixed(3)} + NO {sig.legs.no.price.toFixed(3)} ={" "}
-          {cost.toFixed(3)}
+          {a.side} {a.price.toFixed(3)} + {b.side} {b.price.toFixed(3)} + fees{" "}
+          {sig.fees_per_contract.toFixed(3)} = {(cost + sig.fees_per_contract).toFixed(3)}
         </Text>
       </View>
 
       {/* Legs */}
       <View style={styles.legsRow}>
         <Leg
-          label={sig.legs.yes.venue}
-          side="YES"
-          price={sig.legs.yes.price}
-          accent={colors.positive}
-          testID="arb-leg-yes"
+          label={a.venue}
+          side={a.side}
+          price={a.price}
+          accent={a.side === "YES" ? colors.positive : colors.negative}
+          testID="arb-leg-a"
         />
         <View style={styles.legSep}>
           <Feather name="git-merge" size={14} color={colors.micro} />
         </View>
         <Leg
-          label={sig.legs.no.venue}
-          side="NO"
-          price={sig.legs.no.price}
-          accent={colors.negative}
-          testID="arb-leg-no"
+          label={b.venue}
+          side={b.side}
+          price={b.price}
+          accent={b.side === "YES" ? colors.positive : colors.negative}
+          testID="arb-leg-b"
         />
       </View>
 

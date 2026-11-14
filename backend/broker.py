@@ -19,9 +19,11 @@ import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import httpx
+
+from fees import order_fee
 
 logger = logging.getLogger("trackmind.broker")
 
@@ -35,15 +37,24 @@ class BaseBroker:
 
 # ----------------- Paper -----------------
 class PaperBroker(BaseBroker):
-    """Simulated execution. Fills at quoted price + small slippage."""
+    """Simulated execution at the signal's executable (ask) price.
+
+    Signals are priced at top-of-book asks, so the only extra cost modelled is a
+    small size-impact slippage for thin books. Fees use each venue's fee model;
+    for a cross-venue arb the per-contract fee of both legs is applied.
+    """
     name = "paper"
 
     async def place_order(self, *, user_id: str, signal: dict, notional: float) -> Dict[str, Any]:
-        slippage = 0.002 if signal.get("liquidity", 0.5) > 0.6 else 0.005
         side = signal.get("side", "YES")
-        price = signal.get("price", 0.5)
-        fill_price = price + slippage if side != "ARB" else price + slippage
+        price = float(signal.get("price", 0.5))
+        slippage = 0.0 if signal.get("liquidity", 0.5) > 0.6 else 0.002
+        fill_price = min(0.999 if side != "ARB" else 1.999, price + slippage)
         contracts = notional / max(0.01, fill_price)
+        if side == "ARB":
+            fees = float(signal.get("fees_per_contract", 0.0)) * contracts
+        else:
+            fees = order_fee(signal.get("venue", "polymarket"), fill_price, contracts)
         return {
             "id": f"fill_{uuid.uuid4().hex[:12]}",
             "broker": self.name,
@@ -56,8 +67,9 @@ class PaperBroker(BaseBroker):
             "price": round(fill_price, 4),
             "contracts": round(contracts, 2),
             "notional": round(notional, 2),
-            "fees": round(notional * 0.005, 4),
+            "fees": round(fees, 4),
             "status": "filled",
+            "order_status": "filled",
             "ts": time.time(),
         }
 
@@ -141,6 +153,8 @@ class PolymarketBroker(BaseBroker):
         if not token_ids or len(token_ids) < 2:
             raise RuntimeError("polymarket_token_ids missing on signal — fetch markets via live_market.py")
         side = signal.get("side", "YES")
+        if side not in ("YES", "NO"):
+            raise RuntimeError(f"polymarket cannot execute side {side!r} as a single order")
         token_id = token_ids[0] if side == "YES" else token_ids[1]
         price = max(0.01, min(0.99, float(signal["price"])))
         size_shares = round(notional / price, 2)
@@ -157,9 +171,16 @@ class PolymarketBroker(BaseBroker):
             resp = await asyncio.to_thread(_submit)
         except Exception as e:  # noqa: BLE001
             raise RuntimeError(f"polymarket order failed: {e}") from e
+        resp = resp or {}
+        if resp.get("success") is False or resp.get("errorMsg"):
+            raise RuntimeError(f"polymarket rejected order: {resp.get('errorMsg') or resp}")
 
-        order_id = resp.get("orderID") or resp.get("orderId") or f"polymarket_{uuid.uuid4().hex[:10]}"
-        fees = round(notional * 0.02, 4)  # ~2% taker reserve
+        order_id = resp.get("orderID") or resp.get("orderId")
+        if not order_id:
+            raise RuntimeError(f"polymarket returned no order id: {resp}")
+        # "matched" = filled immediately; "live"/"delayed" = resting on the book.
+        order_status = "filled" if (resp.get("status") or "").lower() == "matched" else "submitted"
+        fees = order_fee("polymarket", price, size_shares)
         return {
             "id": str(order_id),
             "broker": self.name,
@@ -174,6 +195,7 @@ class PolymarketBroker(BaseBroker):
             "notional": round(notional, 2),
             "fees": fees,
             "status": "submitted",
+            "order_status": order_status,
             "ts": time.time(),
             "raw": resp,
         }
@@ -248,9 +270,15 @@ class KalshiBroker(BaseBroker):
         if not ticker:
             raise RuntimeError("kalshi_ticker missing on signal — fetch markets via live_market.py")
         side = signal.get("side", "YES")
+        if side not in ("YES", "NO"):
+            raise RuntimeError(f"kalshi cannot execute side {side!r} as a single order")
+        # `price` is the ask for the side being bought. Kalshi takes the limit in
+        # cents on that side's own field: yes_price for YES, no_price for NO.
         price = float(signal["price"])
-        yes_price_cents = max(1, min(99, int(round(price * 100))))
-        count = max(1, int(notional / max(0.01, price)))
+        price_cents = max(1, min(99, int(round(price * 100))))
+        count = int(round(notional * 100)) // price_cents  # integer cents: no float floor error
+        if count < 1:
+            raise RuntimeError(f"notional ${notional:.2f} buys less than one contract at {price_cents}c")
 
         body = {
             "ticker": ticker,
@@ -258,7 +286,7 @@ class KalshiBroker(BaseBroker):
             "side": "yes" if side == "YES" else "no",
             "type": "limit",
             "count": count,
-            "yes_price": yes_price_cents,
+            ("yes_price" if side == "YES" else "no_price"): price_cents,
             "client_order_id": uuid.uuid4().hex,
         }
         body_bytes = json.dumps(body).encode()
@@ -270,8 +298,16 @@ class KalshiBroker(BaseBroker):
         if r.status_code >= 400:
             raise RuntimeError(f"kalshi order failed: {r.status_code} {r.text[:200]}")
         order = (r.json() or {}).get("order", {})
+        if not order.get("order_id"):
+            raise RuntimeError(f"kalshi returned no order id: {str(order)[:200]}")
+        # "executed" = fully filled; "resting" = on the book; "canceled" = rejected/expired.
+        k_status = (order.get("status") or "").lower()
+        if k_status == "canceled":
+            raise RuntimeError("kalshi order was canceled immediately")
+        order_status = "filled" if k_status == "executed" else "submitted"
+        exec_price = price_cents / 100.0
         return {
-            "id": str(order.get("order_id") or f"kalshi_{uuid.uuid4().hex[:10]}"),
+            "id": str(order["order_id"]),
             "broker": self.name,
             "user_id": user_id,
             "engine": signal["engine"],
@@ -279,11 +315,12 @@ class KalshiBroker(BaseBroker):
             "market": signal["market"],
             "venue": "kalshi",
             "side": side,
-            "price": round(price, 4),
+            "price": round(exec_price, 4),
             "contracts": count,
-            "notional": round(notional, 2),
-            "fees": round(notional * 0.07 * (1 - price), 4),
+            "notional": round(count * exec_price, 2),
+            "fees": order_fee("kalshi", exec_price, count),
             "status": "submitted",
+            "order_status": order_status,
             "ts": time.time(),
             "raw": order,
         }

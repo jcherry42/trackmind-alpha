@@ -21,7 +21,7 @@ jobs:
         run: |
           python -m pip install -U pip
           pip install -r requirements.txt
-          pip install ruff
+          pip install ruff mongomock-motor
 
       - name: Ruff (blocking)
         working-directory: backend
@@ -35,7 +35,7 @@ jobs:
           JWT_SECRET: ci-secret-${{ github.run_id }}
           ADMIN_EMAIL: admin@trackmind.io
           ADMIN_PASSWORD: Admin123!
-        run: pytest tests/test_units.py -q
+        run: pytest tests/ -q --ignore=tests/test_trackmind.py
 
       # Integration tests run against a live server; start it inline.
       - name: Start backend for integration tests

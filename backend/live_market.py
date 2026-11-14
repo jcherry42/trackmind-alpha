@@ -14,14 +14,17 @@ Both endpoints are stable, public, and unmetered (no API key needed).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import httpx
 
 from markets import Quote, market_store
+from pairs import load_verified_pairs, resolve_pairs, suggest_pairs
 
 logger = logging.getLogger("trackmind.live_market")
 
@@ -62,14 +65,41 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
+def _opt_price(x: Any) -> Optional[float]:
+    """Parse a 0..1 price; None if missing / out of range."""
+    v = _safe_float(x, -1.0)
+    return v if 0.0 < v < 1.0 else None
+
+
+def _json_list(x: Any) -> list:
+    if isinstance(x, list):
+        return x
+    if isinstance(x, str):
+        try:
+            v = json.loads(x)
+            return v if isinstance(v, list) else []
+        except Exception:  # noqa: BLE001
+            return []
+    return []
+
+
+def _iso_to_ts(s: Any) -> Optional[float]:
+    if not s or not isinstance(s, str):
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
 def _slug_to_canonical(s: str) -> str:
     """Stable, length-bounded canonical id from a venue slug."""
-    return (s or "unknown").lower().replace(" ", "_").replace("/", "_")[:64]
+    return (s or "unknown").lower().replace(" ", "_").replace("/", "_")[:80]
 
 
 # ---- Polymarket -------------------------------------------------------------
 async def _fetch_polymarket(client: httpx.AsyncClient) -> List[Quote]:
-    """Pull active Polymarket markets via Gamma REST and shape into our Quote dataclass."""
+    """Pull active Polymarket markets via Gamma REST and shape into Quotes."""
     url = f"{POLYMARKET_GAMMA}/markets"
     params = {
         "closed": "false",
@@ -85,74 +115,63 @@ async def _fetch_polymarket(client: httpx.AsyncClient) -> List[Quote]:
         data = data["markets"]
     if not isinstance(data, list):
         return []
-    quotes: List[Quote] = []
     now = time.time()
-    for m in data:
-        q = _parse_polymarket_market(m, now)
-        if q is not None:
-            quotes.append(q)
-    return quotes
+    return [q for q in (_parse_polymarket_market(m, now) for m in data) if q is not None]
 
 
 def _parse_polymarket_market(m: Dict[str, Any], now: float) -> Optional[Quote]:
-    """Shape a single Polymarket Gamma market dict into our Quote. Returns None
-    if the market lacks a real two-sided price.
+    """Shape one Gamma market into a Quote. None if not a live two-sided binary.
 
-    Shared by the top-by-volume and per-sport fetchers below.
+    Gamma reports ``bestBid`` / ``bestAsk`` for outcome 0 (the "YES" token). On a
+    binary CLOB the NO book mirrors it: NO ask = 1 − YES bid, NO bid = 1 − YES ask.
     """
-    # outcomePrices typically a JSON string like '["0.62", "0.38"]'.
-    prices = m.get("outcomePrices") or []
-    if isinstance(prices, str):
-        import json
-        try:
-            prices = json.loads(prices)
-        except Exception:
-            prices = []
-    if not prices or len(prices) < 2:
-        return None
+    prices = _json_list(m.get("outcomePrices"))
+    tokens = _json_list(m.get("clobTokenIds"))
+    outcomes = _json_list(m.get("outcomes")) or ["Yes", "No"]
+    if len(prices) != 2 or len(tokens) != 2:
+        return None  # multi-outcome / malformed — not supported as a binary
     yes = _safe_float(prices[0])
     no = _safe_float(prices[1])
-    if yes <= 0 or no <= 0:
+    if yes <= 0 or no <= 0 or yes >= 0.995 or no >= 0.995:
+        return None  # resolved / locked
+    if m.get("acceptingOrders") is False or m.get("enableOrderBook") is False:
         return None
-    # Skip locked/resolved markets (0/1 or 1/0 — common for losing teams late in a series).
-    if yes >= 0.995 or no >= 0.995:
+    cond = (m.get("conditionId") or "").lower()
+    if not cond:
         return None
+    yes_bid = _opt_price(m.get("bestBid"))
+    yes_ask = _opt_price(m.get("bestAsk"))
+    if yes_bid is not None and yes_ask is not None and yes_bid < yes_ask:
+        mid_yes = (yes_bid + yes_ask) / 2.0
+    else:
+        mid_yes = yes
     title = (m.get("question") or m.get("title") or m.get("slug") or "?")[:160]
-    cid = _slug_to_canonical(m.get("conditionId") or m.get("slug") or title)
-    liq = _safe_float(m.get("liquidity") or m.get("liquidityNum"))
-    vol = _safe_float(m.get("volume24hr") or m.get("volume"))
-    tokens = m.get("clobTokenIds") or []
-    if isinstance(tokens, str):
-        import json
-        try:
-            tokens = json.loads(tokens)
-        except Exception:
-            tokens = []
-    q = Quote(
+    liq = _safe_float(m.get("liquidityNum") or m.get("liquidity"))
+    vol = _safe_float(m.get("volume24hr") or m.get("volume24hrClob") or m.get("volume"))
+    return Quote(
         venue="polymarket",
-        canonical_id=cid,
+        canonical_id=_slug_to_canonical(cond),
         title=title,
-        yes=round(yes, 4),
-        no=round(no, 4),
+        yes=round(mid_yes, 4),
+        no=round(1.0 - mid_yes, 4),
         volume_24h=vol,
         liquidity=min(1.0, liq / 10_000) if liq else 0.3,
         updated_at=now,
-        history=[yes],
+        history=[],
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        no_bid=round(1.0 - yes_ask, 4) if yes_ask is not None else None,
+        no_ask=round(1.0 - yes_bid, 4) if yes_bid is not None else None,
+        polymarket_condition_id=cond,
+        polymarket_token_ids=[str(t) for t in tokens],
+        outcomes=[str(o) for o in outcomes[:2]],
+        end_ts=_iso_to_ts(m.get("endDate")),
+        source="live",
     )
-    setattr(q, "polymarket_condition_id", m.get("conditionId"))
-    setattr(q, "polymarket_token_ids", tokens)
-    return q
 
 
 async def _fetch_polymarket_sport(client: httpx.AsyncClient, tag_slug: str) -> List[Quote]:
-    """Fetch markets for a single sports tag via Gamma /events.
-
-    The /events endpoint actually filters by tag_slug (the /markets one returns
-    the global top-100 regardless of tag_slug). Each event contains an embedded
-    `markets` array which we flatten + parse via _parse_polymarket_market.
-    Markets are sorted by event volume24hr descending so we get the most
-    actively-traded games first. Capped at MAX_MARKETS_PER_SPORT.
-    """
+    """Fetch markets for one sports tag via Gamma /events (which honours tag_slug)."""
     url = f"{POLYMARKET_GAMMA}/events"
     params = {
         "closed": "false",
@@ -180,9 +199,7 @@ async def _fetch_polymarket_sport(client: httpx.AsyncClient, tag_slug: str) -> L
             q = _parse_polymarket_market(m, now)
             if q is None:
                 continue
-            # Tag the quote with its sports category so the UI / engines can
-            # color-code or filter later.
-            setattr(q, "sport_tag", tag_slug)
+            q.sport_tag = tag_slug
             quotes.append(q)
             if len(quotes) >= MAX_MARKETS_PER_SPORT:
                 return quotes
@@ -190,104 +207,144 @@ async def _fetch_polymarket_sport(client: httpx.AsyncClient, tag_slug: str) -> L
 
 
 # ---- Kalshi -----------------------------------------------------------------
-async def _fetch_kalshi(client: httpx.AsyncClient) -> List[Quote]:
-    """Pull open Kalshi markets via public v2 API.
+def _parse_kalshi_market(m: Dict[str, Any], now: float) -> Optional[Quote]:
+    """Shape one Kalshi v2 market (dollar-decimal fields) into a Quote."""
+    yes_bid = _opt_price(m.get("yes_bid_dollars"))
+    yes_ask = _opt_price(m.get("yes_ask_dollars"))
+    no_bid = _opt_price(m.get("no_bid_dollars"))
+    no_ask = _opt_price(m.get("no_ask_dollars"))
+    # Derive the missing side of the book from the mirror if needed.
+    if no_ask is None and yes_bid is not None:
+        no_ask = round(1.0 - yes_bid, 4)
+    if no_bid is None and yes_ask is not None:
+        no_bid = round(1.0 - yes_ask, 4)
+    last = _opt_price(m.get("last_price_dollars"))
+    if yes_bid is not None and yes_ask is not None:
+        mid_yes = (yes_bid + yes_ask) / 2.0
+    elif last is not None:
+        mid_yes = last
+    else:
+        return None  # no tradable price
+    ticker = m.get("ticker")
+    if not ticker:
+        return None
+    title = (m.get("title") or m.get("yes_sub_title") or ticker)[:160]
+    sub = m.get("yes_sub_title")
+    if sub and sub not in title:
+        title = f"{title} — {sub}"[:160]
+    liq = _safe_float(m.get("liquidity_dollars"))
+    if not liq:
+        # `liquidity_dollars` was dropped from the v2 market object; approximate
+        # top-of-book depth in dollars from the quoted sizes instead.
+        sizes = _safe_float(m.get("yes_bid_size_fp")) + _safe_float(m.get("yes_ask_size_fp"))
+        liq = sizes * mid_yes
+    vol = _safe_float(m.get("volume_24h_fp")) or _safe_float(m.get("volume_24h")) or _safe_float(m.get("volume_fp"))
+    return Quote(
+        venue="kalshi",
+        canonical_id=_slug_to_canonical(ticker),
+        title=title,
+        yes=round(mid_yes, 4),
+        no=round(1.0 - mid_yes, 4),
+        volume_24h=vol,
+        liquidity=min(1.0, liq / 10_000) if liq else 0.3,
+        updated_at=now,
+        history=[],
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        no_bid=no_bid,
+        no_ask=no_ask,
+        kalshi_ticker=ticker,
+        kalshi_event_ticker=m.get("event_ticker"),
+        end_ts=_iso_to_ts(m.get("close_time")),
+        source="live",
+    )
 
-    Kalshi switched to dollar-decimal strings (no _cents fields) in mid-2025.
-    We read ``yes_bid_dollars`` / ``yes_ask_dollars`` and convert.
-    """
+
+async def _fetch_kalshi(client: httpx.AsyncClient) -> List[Quote]:
     url = f"{KALSHI_BASE}/markets"
-    params = {"status": "open", "limit": str(MAX_MARKETS_PER_VENUE)}
+    params = {"status": "open", "limit": str(MAX_MARKETS_PER_VENUE), "mve_filter": "exclude"}
     r = await client.get(url, params=params, timeout=8.0)
     r.raise_for_status()
-    data = r.json()
-    rows = data.get("markets") or []
+    rows = (r.json() or {}).get("markets") or []
     if not isinstance(rows, list):
         return []
-    quotes: List[Quote] = []
     now = time.time()
-    for m in rows:
-        # Skip multivariate placeholders with no real pricing.
-        yes_bid = _safe_float(m.get("yes_bid_dollars"))
-        yes_ask = _safe_float(m.get("yes_ask_dollars"))
-        last = _safe_float(m.get("last_price_dollars"))
-        # Prefer mid-of-book; fall back to last price.
-        if yes_bid > 0 and yes_ask > 0:
-            mid_yes = (yes_bid + yes_ask) / 2.0
-        elif yes_ask > 0:
-            mid_yes = yes_ask  # one-sided book
-        elif last > 0:
-            mid_yes = last
-        else:
-            continue
-        if mid_yes <= 0 or mid_yes >= 1:
-            continue
-        mid_no = 1.0 - mid_yes
-        title = (m.get("title") or m.get("yes_sub_title") or m.get("ticker") or "?")[:160]
-        cid = _slug_to_canonical(m.get("ticker") or m.get("event_ticker") or title)
-        liq = _safe_float(m.get("liquidity_dollars"))
-        vol = _safe_float(m.get("volume_24h_fp")) or _safe_float(m.get("volume_fp"))
-        q = Quote(
-            venue="kalshi",
-            canonical_id=cid,
-            title=title,
-            yes=round(mid_yes, 4),
-            no=round(mid_no, 4),
-            volume_24h=vol,
-            liquidity=min(1.0, liq / 10_000) if liq else 0.3,
-            updated_at=now,
-            history=[mid_yes],
-        )
-        setattr(q, "kalshi_ticker", m.get("ticker"))
-        setattr(q, "kalshi_event_ticker", m.get("event_ticker"))
-        quotes.append(q)
-    return quotes
+    return [q for q in (_parse_kalshi_market(m, now) for m in rows) if q is not None]
 
 
-# ---- canonical id matching across venues -----------------------------------
-def _match_cross_venue(polys: List[Quote], kalshis: List[Quote]) -> None:
-    """If a Polymarket and a Kalshi market look like they're about the same event,
-    rewrite Kalshi's canonical_id to match Polymarket's so the Micro (arb) engine can pair them.
+# ---- resolution lookups (used by paper settlement) ---------------------------
+def parse_polymarket_resolution(m: Dict[str, Any]) -> Optional[str]:
+    """Outcome of one Gamma market dict: "YES" (outcome 0 won), "NO" (outcome 1), "VOID", or None.
 
-    Naive keyword overlap — good enough for MVP; replace with a labelled mapping later.
+    "YES"/"NO" are positional: outcome 0 / outcome 1, whatever their labels
+    (e.g. "Over"/"Under", team names). That matches token_ids[0] / token_ids[1].
     """
-    def tokens(t: str) -> set:
-        return {w.lower() for w in t.split() if len(w) > 2}
+    if not m.get("closed"):
+        return None
+    uma = (m.get("umaResolutionStatus") or "").lower()
+    if uma and uma != "resolved":
+        return None  # proposed / disputed — prices aren't final yet
+    prices = [_safe_float(p) for p in _json_list(m.get("outcomePrices"))]
+    if len(prices) != 2:
+        return None
+    if prices[0] >= 0.99 and prices[1] <= 0.01:
+        return "YES"
+    if prices[1] >= 0.99 and prices[0] <= 0.01:
+        return "NO"
+    if abs(prices[0] - 0.5) < 0.01 and abs(prices[1] - 0.5) < 0.01:
+        return "VOID"
+    return None
 
-    for k in kalshis:
-        kt = tokens(k.title)
-        best: Optional[Quote] = None
-        best_score = 0
-        for p in polys:
-            pt = tokens(p.title)
-            overlap = len(kt & pt)
-            if overlap >= 3 and overlap > best_score:
-                best, best_score = p, overlap
-        if best:
-            k.canonical_id = best.canonical_id
+
+def parse_kalshi_resolution(m: Dict[str, Any]) -> Optional[str]:
+    """Outcome of one Kalshi v2 market dict once settled/finalized, else None."""
+    if (m.get("status") or "").lower() not in ("settled", "finalized", "determined"):
+        return None
+    result = (m.get("result") or "").lower()
+    if result == "yes":
+        return "YES"
+    if result == "no":
+        return "NO"
+    if result in ("void", "voided"):
+        return "VOID"
+    return None
+
+
+async def fetch_polymarket_resolution(client: httpx.AsyncClient, condition_id: str) -> Optional[str]:
+    r = await client.get(f"{POLYMARKET_GAMMA}/markets", params={"condition_ids": condition_id, "closed": "true"}, timeout=8.0)
+    r.raise_for_status()
+    data = r.json()
+    rows = data if isinstance(data, list) else (data or {}).get("markets", [])
+    for m in rows or []:
+        if (m.get("conditionId") or "").lower() == (condition_id or "").lower():
+            return parse_polymarket_resolution(m)
+    return None
+
+
+async def fetch_kalshi_resolution(client: httpx.AsyncClient, ticker: str) -> Optional[str]:
+    r = await client.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=8.0)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return parse_kalshi_resolution((r.json() or {}).get("market") or {})
 
 
 # ---- ingest loop ------------------------------------------------------------
 _running = False
+# Latest unverified cross-venue candidates, for operator review via the API.
+pair_candidates: List[dict] = []
 
 
 async def _refresh_once() -> None:
-    """Single fetch+swap cycle. Failures are absorbed silently with a warning.
-
-    Pulls Polymarket markets from two sources concurrently:
-      1. Top-N by volume (existing — politics/crypto-heavy).
-      2. Per-sport via /events?tag_slug=<sport> for NBA/NFL/MLB/NHL/NCAA F&B.
-    Deduplicates by (venue, canonical_id) and respects POLYMARKET_HARD_CAP.
-    """
+    """One fetch + swap cycle. Venue failures keep the previous snapshot."""
+    global pair_candidates
     async with httpx.AsyncClient(headers={"User-Agent": "TRACKMIND/1.0"}) as client:
-        # Top-by-volume (Polymarket + Kalshi) in parallel.
         top_results = await asyncio.gather(
             _fetch_polymarket(client),
             _fetch_kalshi(client),
             return_exceptions=True,
         )
         polys_top, kalshis = top_results
-        # Per-sport Polymarket fetches in parallel.
         sport_results = await asyncio.gather(
             *[_fetch_polymarket_sport(client, tag) for tag in SPORTS_TAGS],
             return_exceptions=True,
@@ -300,16 +357,13 @@ async def _refresh_once() -> None:
         logger.warning(f"kalshi fetch failed: {kalshis}")
         kalshis = []
 
-    # Combine: top-by-volume first (preferred), then sports in declared order.
-    # Dedup by canonical_id — sports markets that ARE in the top-30 won't be double-counted.
     seen: set = set()
     polys: List[Quote] = []
     sport_counts: Dict[str, int] = {tag: 0 for tag in SPORTS_TAGS}
     for q in polys_top:
-        if q.canonical_id in seen:
-            continue
-        seen.add(q.canonical_id)
-        polys.append(q)
+        if q.canonical_id not in seen:
+            seen.add(q.canonical_id)
+            polys.append(q)
     for tag, result in zip(SPORTS_TAGS, sport_results):
         if isinstance(result, Exception):
             logger.warning(f"polymarket sport {tag} failed: {result}")
@@ -324,29 +378,30 @@ async def _refresh_once() -> None:
             sport_counts[tag] += 1
 
     if not polys and not kalshis:
-        # Total venue outage: keep prior snapshot.
-        return
+        return  # total outage: keep prior snapshot
 
-    _match_cross_venue(polys, kalshis)
+    # If one venue failed this cycle, carry its previous quotes forward so a
+    # transient outage on one side doesn't wipe it from the store.
+    if not polys or not kalshis:
+        prev = market_store.all() if market_store.mode == "live" else []
+        if not polys:
+            polys = [q for q in prev if q.venue == "polymarket"]
+        if not kalshis:
+            kalshis = [q for q in prev if q.venue == "kalshi"]
 
-    # Swap into the in-memory store. We REPLACE rather than merge so stale markets disappear.
-    with market_store._lock:  # safe enough; module-level singleton  # noqa: SLF001
-        prev = {(q.venue, q.canonical_id): q for q in market_store._quotes.values()}  # noqa: SLF001
-        new_quotes: Dict[tuple, Quote] = {}
-        for q in (polys + kalshis):
-            prior = prev.get((q.venue, q.canonical_id))
-            if prior:
-                q.history = (prior.history + [q.yes])[-120:]
-            new_quotes[(q.venue, q.canonical_id)] = q
-        if new_quotes:
-            market_store._quotes = new_quotes  # noqa: SLF001
+    pairs = resolve_pairs(polys, kalshis, load_verified_pairs())
+    pair_candidates = suggest_pairs(polys, kalshis)
+    stored = market_store.set_live_snapshot(polys + kalshis, pairs=pairs)
+
     sports_summary = " ".join(f"{tag}={n}" for tag, n in sport_counts.items() if n > 0)
     logger.info(
         "live_ingest_refreshed",
         extra={
             "polymarket": len(polys),
             "kalshi": len(kalshis),
-            "total": len(polys) + len(kalshis),
+            "total": stored,
+            "verified_pairs": len(pairs),
+            "pair_candidates": len(pair_candidates),
             "sports": sports_summary or None,
         },
     )

@@ -1,0 +1,10 @@
+[
+  {
+    "polymarket_condition_id": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "kalshi_ticker": "KXEXAMPLE-26DEC31-T100",
+    "polarity": "same",
+    "label": "Example: same event, same threshold, same resolution source",
+    "verified_by": "your-initials",
+    "notes": "Compared both venues' rules pages on YYYY-MM-DD: resolution source, cutoff time, and edge cases (ties, cancellations) all match."
+  }
+]
