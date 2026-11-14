@@ -78,6 +78,8 @@ def run(now: Optional[float] = None) -> List[dict]:
             "side": side,
             "price": round(price, 4),
             "mid": round(q.yes if side == "YES" else q.no, 4),
+            # Model probability that `side` wins: market mid plus the momentum edge.
+            "fair_prob": round(min(0.99, max(0.01, (q.yes if side == "YES" else q.no) + gross_edge)), 4),
             "confidence": round(confidence, 3),
             "expected_edge": expected_edge,
             "risk": risk,

@@ -51,12 +51,11 @@ from crypto import encrypt_payload, fingerprint_for
 from push import push_to_user as _push_to_user_async, DEFAULT_NOTIFY_PREFS
 import live_market
 import paper_settlement
-from live_market import (
-    LIVE_INGEST_ENABLED,
-    fetch_kalshi_resolution,
-    fetch_polymarket_resolution,
-    ingest_forever,
-)
+from live_market import LIVE_INGEST_ENABLED, ingest_forever
+import news
+import resolutions
+import scorecard
+import whale_records
 from pairs import load_verified_pairs
 from exchange_settlement import (
     poll_loop as _polygon_poll_loop,
@@ -477,6 +476,12 @@ async def refresh_engines() -> None:
         _engine_cache["by_engine"] = by_engine
         _engine_cache["by_id"] = by_id
         _engine_cache["updated_at"] = time.time()
+
+    # Scorecard: open a prediction episode for every new call each engine makes.
+    try:
+        await scorecard.log_predictions(db, all_signals)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"scorecard.log_predictions failed: {e}")
     logger.info(
         f"engines refreshed: alpha={len(alpha_signals)} quant={len(quant_signals)} "
         f"whale={len(whale_signals)} micro={len(micro_signals)}"
@@ -535,7 +540,7 @@ async def settle_open_positions(user: dict) -> float:
 
     Settlement:
       * live positions — never here (venue watchers own them).
-      * paper positions on LIVE data — never here; `paper_resolution_loop`
+      * paper positions on LIVE data — never here; `resolution_loop`
         settles them at the real market outcome.
       * paper positions on MOCK data — simulated resolution with a time-based
         hazard and an outcome drawn from the market's own price (no built-in edge).
@@ -583,16 +588,13 @@ async def settle_open_positions(user: dict) -> float:
     return round(realized_delta, 2)
 
 
-async def _fetch_leg_outcome(client, leg: dict) -> Optional[str]:
+def _leg_ref(leg: dict) -> tuple[Optional[str], Optional[str]]:
     venue = leg.get("venue")
-    try:
-        if venue == "polymarket" and leg.get("polymarket_condition_id"):
-            return await fetch_polymarket_resolution(client, leg["polymarket_condition_id"])
-        if venue == "kalshi" and leg.get("kalshi_ticker"):
-            return await fetch_kalshi_resolution(client, leg["kalshi_ticker"])
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"resolution lookup failed for {venue}: {e}")
-    return None
+    if venue == "polymarket":
+        return venue, leg.get("polymarket_condition_id")
+    if venue == "kalshi":
+        return venue, leg.get("kalshi_ticker")
+    return venue, None
 
 
 async def resolve_live_paper_positions() -> int:
@@ -613,9 +615,10 @@ async def resolve_live_paper_positions() -> int:
                 continue
             outcomes: Dict[int, str] = {}
             for i, leg in enumerate(legs):
-                key = (leg.get("venue"), leg.get("polymarket_condition_id") or leg.get("kalshi_ticker"))
+                venue, ref = _leg_ref(leg)
+                key = (venue, ref)
                 if key not in cache:
-                    cache[key] = await _fetch_leg_outcome(client, leg)
+                    cache[key] = await resolutions.get_outcome(db, client, venue, ref) if ref else None
                 if cache[key] is None:
                     break
                 outcomes[i] = cache[key]
@@ -633,14 +636,25 @@ async def resolve_live_paper_positions() -> int:
     return settled
 
 
-async def paper_resolution_loop() -> None:
+async def resolution_loop() -> None:
+    """Everything that waits on markets resolving: paper settlement, scorecard, whale records."""
+    import httpx
+
     while True:
         try:
-            n = await resolve_live_paper_positions()
-            if n:
-                logger.info(f"paper_resolution: settled {n} positions at real outcomes")
+            if market_store.mode == "live":
+                n = await resolve_live_paper_positions()
+                if n:
+                    logger.info(f"paper_resolution: settled {n} positions at real outcomes")
+            async with httpx.AsyncClient(headers={"User-Agent": "TRACKMIND/1.0"}) as client:
+                counts = await scorecard.score_pending(db, client, market_store)
+                if counts["live"] or counts["mock"]:
+                    logger.info("scorecard_scored", extra=counts)
+                wcounts = await whale_records.update_records(db, client)
+                if wcounts.get("scored"):
+                    logger.info("whale_records_updated", extra=wcounts)
         except Exception as e:  # noqa: BLE001
-            logger.warning(f"paper_resolution loop error: {e}")
+            logger.warning(f"resolution loop error: {e}")
         await asyncio.sleep(PAPER_RESOLUTION_POLL_SEC)
 
 
@@ -1317,6 +1331,25 @@ async def auto_deploy(
         if ikey:
             await _abort_idempotency(ikey, user_id)
         raise
+
+
+# ---------- engine scorecard ----------
+@api.get("/analytics/engines")
+async def engine_scorecard(source: Optional[str] = None, days: int = 30, user: dict = Depends(get_current_user)):
+    """Did each engine's predictions come true? Brier/skill vs market, calibration, realized P&L.
+
+    `source=live` scores real venue resolutions; `source=mock` scores demo markets
+    (simulated, unbiased resolution — says nothing about real skill). Defaults to
+    the current data mode.
+    """
+    src = source or market_store.mode
+    if src not in ("live", "mock"):
+        raise HTTPException(status_code=400, detail="source must be 'live' or 'mock'")
+    days = max(1, min(365, days))
+    report = await scorecard.engine_report(db, src, time.time() - days * 86400)
+    report["days"] = days
+    report["min_sample_for_verdict"] = scorecard.MIN_SAMPLE_FOR_VERDICT
+    return report
 
 
 # ---------- analytics ----------
@@ -2295,6 +2328,11 @@ def _serialize_tracked_wallet(w: dict) -> dict:
         "last_entry_at": w["last_entry_at"].isoformat() if w.get("last_entry_at") else None,
         "added_by_user_id": w.get("added_by_user_id"),
         "created_at": w["created_at"].isoformat() if w.get("created_at") else None,
+        # Measured track record on resolved markets (see whale_records.py).
+        "record_n": int(w.get("record_n") or 0),
+        "record_win_rate": w.get("record_win_rate"),
+        "record_edge": w.get("record_edge"),
+        "record_roi": w.get("record_roi"),
     }
 
 
@@ -2653,10 +2691,17 @@ async def on_startup():
     if LIVE_INGEST_ENABLED:
         asyncio.create_task(ingest_forever())
         logger.info("live ingest task scheduled")
-        # Paper positions on live markets settle at the real outcome.
-        await db.positions.create_index([("status", 1), ("broker", 1), ("data_source", 1)])
-        asyncio.create_task(paper_resolution_loop())
-        logger.info("paper resolution loop scheduled")
+        if news.news_source() == "gdelt":
+            asyncio.create_task(news.news_loop(market_store))
+            logger.info("gdelt news loop scheduled")
+
+    # Resolution loop: paper settlement at real outcomes, engine scorecard, whale records.
+    await db.positions.create_index([("status", 1), ("broker", 1), ("data_source", 1)])
+    await resolutions.ensure_indexes(db)
+    await scorecard.ensure_indexes(db)
+    await whale_records.ensure_indexes(db)
+    asyncio.create_task(resolution_loop())
+    logger.info("resolution loop scheduled")
 
     # Polygon settlement watcher — only starts if POLYGON_RPC_URL is set.
     # No-ops gracefully (logs a warning + returns) if the env var is missing.

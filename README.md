@@ -21,6 +21,10 @@ trackmind/
 │   ├── pairs.py              # verified cross-venue pairs + review candidates
 │   ├── fees.py               # venue fee models
 │   ├── paper_settlement.py   # mark-to-market + honest paper settlement
+│   ├── resolutions.py        # shared market-resolution cache
+│   ├── scorecard.py          # engine prediction log + scoring
+│   ├── whale_records.py      # measured wallet track records
+│   ├── news.py               # GDELT headlines for Alpha
 │   ├── allocator.py          # master allocator + risk constraints
 │   ├── broker.py             # Paper/Polymarket/Kalshi adapters
 │   ├── engines/              # alpha, quant, whale, micro
@@ -75,9 +79,9 @@ positions then settle at the market's **real** resolution, so paper P&L is an ho
 ## Engines
 | Engine | Strategy | Status |
 | ------ | -------- | ------ |
-| **Alpha** | Narrative/catalyst score nudges the market's own price (max ±`ALPHA_MAX_SHIFT`) | **Demo only.** The news feed is synthetic, so Alpha switches itself off on live data until a real news source is connected (`ALPHA_ALLOW_SYNTHETIC=true` overrides for testing). |
+| **Alpha** | Recent news, judged by an LLM, nudges the market's own price (max ±`ALPHA_MAX_SHIFT`) | Live data: real headlines from **GDELT** when `ALPHA_NEWS_SOURCE=gdelt` **and** an LLM key is set (`ANTHROPIC_API_KEY`, or `EMERGENT_LLM_KEY`). The LLM must judge headlines relevant and not already priced in; otherwise no signal. Demo data: synthetic headlines. |
 | **Quant** | Short-horizon persistence/momentum on observed history | Works on live snapshots. Edge is net of half-spread + venue fees. |
-| **Whale** | Consensus buys by tracked Polymarket wallets (on-chain Data API) | Real data. Edge formula is an uncalibrated prior (`edge_calibrated: false`) until wallet hit rates are measured. |
+| **Whale** | Consensus buys by tracked Polymarket wallets (on-chain Data API) | Edge = what the wallets paid + their **measured** edge on resolved markets (shrunk toward 0 by sample size). Falls back to an uncalibrated prior (`edge_calibrated: false`) until the consensus wallets have `WHALE_MIN_RECORD` (30) resolved trades; `WHALE_REQUIRE_CALIBRATION=true` suppresses those. |
 | **Micro** | Cross-venue arb: asks of complementary legs + both venues' fees < $1.00 | Only scans **human-verified** pairs from `backend/market_pairs.json` (see `market_pairs.example.json`). Title-similarity matches are listed at `GET /api/markets/pairs` for review and are never traded. Paper only until two-venue execution exists. |
 
 All signals are priced at the **ask** (what you'd actually pay) and carry `polymarket_token_ids` /
@@ -118,6 +122,30 @@ applies risk constraints, and emits sized orders for execution.
 
 Above 60% drawdown ratio the allocator auto-switches into **defensive mode** (60% size cut).
 
+## Engine scorecard (`GET /api/analytics/engines`)
+Every call an engine makes is logged once as a prediction (at the price it was first actionable) and
+scored when the market resolves: Brier score vs the market's own odds (`skill_vs_market > 0` = beat the
+market), log loss, calibration buckets, and **realized profit per $1 contract after fees** vs the edge
+the engine claimed. Verdicts need 30+ resolved calls and are judged at ±2 standard errors. Shown on the
+Analytics screen. `?source=live` scores real resolutions; `?source=mock` scores demo markets (simulated
+from market prices, so it shows no real skill by design).
+
+Resolutions come from one cache (`resolutions.py`, collection `market_resolutions`) shared by paper
+settlement, the scorecard and whale records, so each market is looked up at most every
+`RESOLUTION_RECHECK_SEC` (300s).
+
+## Whale track records
+Each tracked wallet's buys are scored when their markets resolve (`whale_records.py` → `whale_results`,
+kept beyond the 14-day `whale_entries` TTL) and rolled up onto `tracked_wallets`: `record_n`,
+`record_win_rate`, `record_edge` (mean of won − price paid), `record_roi`. Assumes positions are held to
+resolution.
+
+## Alpha news (GDELT)
+`news.py` refreshes headlines for the top `ALPHA_NEWS_MARKETS` (40) live Polymarket markets by volume,
+one GDELT request every `GDELT_MIN_INTERVAL_SEC` (6s, GDELT's limit is 1 per 5s), cached for
+`NEWS_TTL_SEC` (15 min). Alpha only reads the cache and re-asks the LLM only when a market's headline set
+changes, at most `ALPHA_MAX_LLM_CALLS_PER_REFRESH` (12) calls per minute. LLM model: `ALPHA_LLM_MODEL`.
+
 ## Execution
 One pipeline (`_execute_signal` in `server.py`) serves `/trade/approve`, `/trade/auto-deploy` and
 `/whales/mirror`, so every route enforces the same guards: kill switch, daily-loss circuit, paused
@@ -144,8 +172,8 @@ Bankroll accounting: the stake is debited at entry; at close the bankroll is cre
 `payout × contracts − fees` and realized P&L is that minus the stake.
 
 ## Known gaps (next phases)
-- Real news/data feed for Alpha; calibration (Brier/log-loss) per engine on resolved markets.
-- Whale edge from measured wallet hit rates; backtesting on historical resolutions.
+- Backtesting on historical resolutions (the scorecard only measures forward from deployment).
+- Use scorecard results to set engine weights / turn off engines that don't beat the market.
 - Order lifecycle: poll/cancel resting orders, partial fills, kill switch cancels open orders.
 - Two-venue arb execution with legging protection.
 - Live bankroll reconciled against real venue balances (today live trades debit the paper bankroll).

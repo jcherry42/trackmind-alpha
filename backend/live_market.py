@@ -233,6 +233,11 @@ def _parse_kalshi_market(m: Dict[str, Any], now: float) -> Optional[Quote]:
     if sub and sub not in title:
         title = f"{title} — {sub}"[:160]
     liq = _safe_float(m.get("liquidity_dollars"))
+    if not liq:
+        # `liquidity_dollars` was dropped from the v2 market object; approximate
+        # top-of-book depth in dollars from the quoted sizes instead.
+        sizes = _safe_float(m.get("yes_bid_size_fp")) + _safe_float(m.get("yes_ask_size_fp"))
+        liq = sizes * mid_yes
     vol = _safe_float(m.get("volume_24h_fp")) or _safe_float(m.get("volume_24h")) or _safe_float(m.get("volume_fp"))
     return Quote(
         venue="kalshi",
@@ -268,37 +273,31 @@ async def _fetch_kalshi(client: httpx.AsyncClient) -> List[Quote]:
 
 
 # ---- resolution lookups (used by paper settlement) ---------------------------
-async def fetch_polymarket_resolution(client: httpx.AsyncClient, condition_id: str) -> Optional[str]:
-    """Return "YES" / "NO" (outcome 0 / outcome 1 won), "VOID" (50/50), or None if unresolved."""
-    r = await client.get(f"{POLYMARKET_GAMMA}/markets", params={"condition_ids": condition_id, "closed": "true"}, timeout=8.0)
-    r.raise_for_status()
-    data = r.json()
-    rows = data if isinstance(data, list) else (data or {}).get("markets", [])
-    for m in rows or []:
-        if (m.get("conditionId") or "").lower() != (condition_id or "").lower():
-            continue
-        if not m.get("closed"):
-            return None
-        prices = [_safe_float(p) for p in _json_list(m.get("outcomePrices"))]
-        if len(prices) != 2:
-            return None
-        if prices[0] >= 0.99:
-            return "YES"
-        if prices[1] >= 0.99:
-            return "NO"
-        if abs(prices[0] - 0.5) < 0.01 and abs(prices[1] - 0.5) < 0.01:
-            return "VOID"
-        return None  # closed but not yet finalised on-chain
+def parse_polymarket_resolution(m: Dict[str, Any]) -> Optional[str]:
+    """Outcome of one Gamma market dict: "YES" (outcome 0 won), "NO" (outcome 1), "VOID", or None.
+
+    "YES"/"NO" are positional: outcome 0 / outcome 1, whatever their labels
+    (e.g. "Over"/"Under", team names). That matches token_ids[0] / token_ids[1].
+    """
+    if not m.get("closed"):
+        return None
+    uma = (m.get("umaResolutionStatus") or "").lower()
+    if uma and uma != "resolved":
+        return None  # proposed / disputed — prices aren't final yet
+    prices = [_safe_float(p) for p in _json_list(m.get("outcomePrices"))]
+    if len(prices) != 2:
+        return None
+    if prices[0] >= 0.99 and prices[1] <= 0.01:
+        return "YES"
+    if prices[1] >= 0.99 and prices[0] <= 0.01:
+        return "NO"
+    if abs(prices[0] - 0.5) < 0.01 and abs(prices[1] - 0.5) < 0.01:
+        return "VOID"
     return None
 
 
-async def fetch_kalshi_resolution(client: httpx.AsyncClient, ticker: str) -> Optional[str]:
-    """Return "YES" / "NO" / "VOID" once a Kalshi market is settled, else None."""
-    r = await client.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=8.0)
-    if r.status_code == 404:
-        return None
-    r.raise_for_status()
-    m = (r.json() or {}).get("market") or {}
+def parse_kalshi_resolution(m: Dict[str, Any]) -> Optional[str]:
+    """Outcome of one Kalshi v2 market dict once settled/finalized, else None."""
     if (m.get("status") or "").lower() not in ("settled", "finalized", "determined"):
         return None
     result = (m.get("result") or "").lower()
@@ -309,6 +308,25 @@ async def fetch_kalshi_resolution(client: httpx.AsyncClient, ticker: str) -> Opt
     if result in ("void", "voided"):
         return "VOID"
     return None
+
+
+async def fetch_polymarket_resolution(client: httpx.AsyncClient, condition_id: str) -> Optional[str]:
+    r = await client.get(f"{POLYMARKET_GAMMA}/markets", params={"condition_ids": condition_id, "closed": "true"}, timeout=8.0)
+    r.raise_for_status()
+    data = r.json()
+    rows = data if isinstance(data, list) else (data or {}).get("markets", [])
+    for m in rows or []:
+        if (m.get("conditionId") or "").lower() == (condition_id or "").lower():
+            return parse_polymarket_resolution(m)
+    return None
+
+
+async def fetch_kalshi_resolution(client: httpx.AsyncClient, ticker: str) -> Optional[str]:
+    r = await client.get(f"{KALSHI_BASE}/markets/{ticker}", timeout=8.0)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return parse_kalshi_resolution((r.json() or {}).get("market") or {})
 
 
 # ---- ingest loop ------------------------------------------------------------

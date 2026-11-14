@@ -28,7 +28,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
 from fees import fee_per_contract
-from markets import ask_for, execution_refs, half_spread, market_store
+import whale_records
+from markets import ask_for, execution_refs, market_store, mid_for
 
 logger = logging.getLogger("trackmind.engine.whale")
 
@@ -40,6 +41,11 @@ WHALE_MIN_CONSENSUS = int(os.environ.get("WHALE_MIN_CONSENSUS", "2"))
 WHALE_MIN_NOTIONAL = float(os.environ.get("WHALE_MIN_NOTIONAL", "2500"))
 # Hard cap on signals returned (top-K by confidence × edge).
 WHALE_MAX_SIGNALS = int(os.environ.get("WHALE_MAX_SIGNALS", "8"))
+# Resolved trades (summed across the consensus wallets) needed before the edge
+# is taken from measured records instead of the uncalibrated prior.
+WHALE_MIN_RECORD = int(os.environ.get("WHALE_MIN_RECORD", "30"))
+# If true, emit no whale signals until the wallets have measured records.
+WHALE_REQUIRE_CALIBRATION = os.environ.get("WHALE_REQUIRE_CALIBRATION", "false").lower() in {"1", "true", "yes"}
 
 
 def _confidence(distinct_wallets: int, notional_usdc: float, agreement: float,
@@ -126,6 +132,7 @@ async def run_async(db: Any = None) -> List[dict]:
             "label": e.get("wallet_label"),
         })
 
+    records = await whale_records.load_records(db)
     signals: List[dict] = []
     now = time.time()
     for cid, g in groups.items():
@@ -144,15 +151,40 @@ async def run_async(db: Any = None) -> List[dict]:
         if quote is None:
             continue
         price = ask_for(quote, majority_side)
-        trade_cost = half_spread(quote, majority_side) + fee_per_contract(quote.venue, price)
+        fee = fee_per_contract(quote.venue, price)
         confidence = _confidence(n_wallets, g["notional"], agreement, recency_sec)
-        # Edge: assume whales are right with probability hit_rate. With public top
-        # wallets averaging ~60% hit, a $5k+ inflow on YES at 0.55 gives a real
-        # but modest edge. Conservative formula.
-        base_edge = 0.04 + 0.02 * agreement + 0.01 * min(2.0, n_wallets / 2.0)
-        # NOTE: uncalibrated prior. Phase 2 replaces this with each wallet's
-        # measured hit rate / ROI on resolved markets.
-        expected_edge = round(base_edge * (0.5 + agreement / 2.0) - trade_cost, 4)
+
+        # Fair value = what the majority paid on average + their measured edge
+        # (each wallet's record shrunk toward 0 by sample size, weighted by size).
+        side_meta = [w for w in g["wallet_meta"] if w["side"] == majority_side]
+        side_entries = [en for en in g["entries"] if en["side"] == majority_side and 0 < en["price"] < 1]
+        notional_side = sum(en["usdc_size"] for en in side_entries) or 0.0
+        whale_avg_price = (
+            sum(en["price"] * en["usdc_size"] for en in side_entries) / notional_side
+            if notional_side > 0 else mid_for(quote, majority_side)
+        )
+        rec_weight, rec_edge_sum, record_n = 0.0, 0.0, 0
+        seen_wallets: set = set()
+        for w in side_meta:
+            rec = records.get(w["address"])
+            if not rec:
+                continue
+            wt = max(1.0, w["usdc_size"])
+            rec_edge_sum += wt * whale_records.shrunk_edge(rec["n"], rec["edge"])
+            rec_weight += wt
+            if w["address"] not in seen_wallets:
+                record_n += rec["n"]
+                seen_wallets.add(w["address"])
+        calibrated = record_n >= WHALE_MIN_RECORD and rec_weight > 0
+        if calibrated:
+            group_edge = rec_edge_sum / rec_weight
+        else:
+            if WHALE_REQUIRE_CALIBRATION:
+                continue
+            # Uncalibrated prior (no measured record yet): a modest assumed edge.
+            group_edge = (0.04 + 0.02 * agreement + 0.01 * min(2.0, n_wallets / 2.0)) * (0.5 + agreement / 2.0)
+        fair_prob = min(0.99, max(0.01, whale_avg_price + group_edge))
+        expected_edge = round(fair_prob - price - fee, 4)
         if expected_edge <= 0:
             continue
         risk = round(max(0.015, 0.05 - expected_edge * 0.6), 4)
@@ -179,12 +211,17 @@ async def run_async(db: Any = None) -> List[dict]:
             "size_hint": size_hint,
             "rationale": (
                 f"{n_wallets} whales bought · ${g['notional']:,.0f} notional · "
-                f"{int(agreement * 100)}% on {majority_side} · "
-                f"{int(recency_sec / 60)}m ago"
+                f"{int(agreement * 100)}% on {majority_side} @ avg {whale_avg_price:.2f} · "
+                f"{int(recency_sec / 60)}m ago · "
+                + (f"edge from {record_n} resolved trades" if calibrated else "edge UNCALIBRATED (no track record yet)")
             ),
             # Surfaced in the signal card UI:
             "wallets": rationale_wallets,
-            "edge_calibrated": False,
+            "fair_prob": round(fair_prob, 4),
+            "mid": round(mid_for(quote, majority_side), 4),
+            "whale_avg_price": round(whale_avg_price, 4),
+            "edge_calibrated": calibrated,
+            "record_n": record_n,
             **execution_refs(quote),
         })
 

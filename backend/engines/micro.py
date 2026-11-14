@@ -87,6 +87,7 @@ def run(now: Optional[float] = None) -> List[dict]:
                 f"= {best['cost'] + best['fees']:.3f} < 1.000"
             ),
             "executable_live": False,
+            "fair_prob": None,  # an arb has no directional forecast; scored on realized payout
             "data_source": p.source,
             "pair_polarity": polarity,
             "legs": [

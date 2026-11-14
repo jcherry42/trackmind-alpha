@@ -82,3 +82,10 @@ Sized via `min(size_hint, 0.15) * sizing_dampener`, where the dampener tightens 
 - Bankroll: stake debited at entry; `payout × contracts − fees` credited at close.
 
 Every request marks open positions to market at the **bid** (liquidation value), net of fees.
+
+## Background loops
+- `ingest_forever` (live data) — venue snapshots every 15s.
+- `news_loop` (live data + `ALPHA_NEWS_SOURCE=gdelt`) — GDELT headlines into the news cache.
+- `refresh_engines` (60s) — run engines, cache signals, log new prediction episodes.
+- `resolution_loop` (`PAPER_RESOLUTION_POLL_SEC`, 120s) — via the shared resolution cache: settle paper
+  positions on live data, score pending predictions, update whale track records.
